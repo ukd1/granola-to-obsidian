@@ -234,10 +234,123 @@ def extract_date_from_doc(doc):
         logger.warning(f"Could not parse date '{date_str}', using current date")
         return datetime.now().strftime("%Y-%m-%d")
 
+def load_sync_state():
+    """
+    Load sync state from the current working directory
+    """
+    sync_state_path = Path('.granola_sync_state.json')
+    
+    if not sync_state_path.exists():
+        logger.info("No existing sync state found - first run or full sync")
+        return {
+            "last_sync_run": None,
+            "documents": {}
+        }
+    
+    try:
+        with open(sync_state_path, 'r') as f:
+            sync_state = json.load(f)
+        logger.debug(f"Loaded sync state with {len(sync_state.get('documents', {}))} tracked documents")
+        return sync_state
+    except Exception as e:
+        logger.error(f"Error loading sync state: {str(e)}")
+        logger.info("Starting with empty sync state")
+        return {
+            "last_sync_run": None,
+            "documents": {}
+        }
+
+def save_sync_state(sync_state):
+    """
+    Save sync state to the current working directory
+    """
+    sync_state_path = Path('.granola_sync_state.json')
+    
+    try:
+        # Update last sync run timestamp
+        sync_state["last_sync_run"] = datetime.now().isoformat()
+        
+        with open(sync_state_path, 'w') as f:
+            json.dump(sync_state, f, indent=2)
+        logger.debug(f"Saved sync state with {len(sync_state.get('documents', {}))} tracked documents")
+    except Exception as e:
+        logger.error(f"Error saving sync state: {str(e)}")
+
+def needs_sync(doc, sync_state, force_full_sync=False):
+    """
+    Determine if a document needs to be synced
+    Returns (needs_sync: bool, reason: str)
+    """
+    if force_full_sync:
+        return True, "full-sync requested"
+    
+    doc_id = doc.get("id")
+    if not doc_id:
+        return True, "missing document ID"
+    
+    # Check if document exists in sync state
+    if doc_id not in sync_state.get("documents", {}):
+        return True, "new document"
+    
+    doc_state = sync_state["documents"][doc_id]
+    granola_updated_at = doc.get("updated_at") or doc.get("created_at")
+    last_synced_updated_at = doc_state.get("granola_updated_at")
+    
+    if not granola_updated_at:
+        return True, "no timestamp from Granola"
+    
+    if not last_synced_updated_at:
+        return True, "no previous sync timestamp"
+    
+    # Compare timestamps (both should be ISO format strings)
+    if granola_updated_at > last_synced_updated_at:
+        return True, f"document updated ({granola_updated_at} > {last_synced_updated_at})"
+    
+    return False, "document unchanged"
+
+def update_sync_state_for_doc(sync_state, doc, filename, has_transcript):
+    """
+    Update sync state for a successfully synced document
+    """
+    doc_id = doc.get("id")
+    if not doc_id:
+        return
+    
+    if "documents" not in sync_state:
+        sync_state["documents"] = {}
+    
+    sync_state["documents"][doc_id] = {
+        "granola_updated_at": doc.get("updated_at") or doc.get("created_at"),
+        "last_synced_at": datetime.now().isoformat(),
+        "local_filename": filename,
+        "has_transcript": has_transcript,
+        "title": doc.get("title", "Untitled")
+    }
+
+def cleanup_old_file(sync_state, doc_id, new_filename, output_path):
+    """
+    Remove old file if document title/filename changed
+    """
+    if doc_id not in sync_state.get("documents", {}):
+        return
+    
+    old_filename = sync_state["documents"][doc_id].get("local_filename")
+    if old_filename and old_filename != new_filename:
+        old_filepath = output_path / old_filename
+        if old_filepath.exists():
+            try:
+                old_filepath.unlink()
+                logger.info(f"Removed old file: {old_filename}")
+            except Exception as e:
+                logger.warning(f"Could not remove old file {old_filename}: {str(e)}")
+
 def main():
     logger.info("Starting Granola sync process")
     parser = argparse.ArgumentParser(description="Fetch Granola notes and save them as Markdown files in an Obsidian folder.")
     parser.add_argument("output_dir", type=str, help="The full path to the Obsidian subfolder where notes should be saved.")
+    parser.add_argument("--full-sync", action="store_true", help="Force sync all documents (ignore timestamps)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be synced without making changes")
+    parser.add_argument("--clean", action="store_true", help="Remove local files for documents deleted from Granola (not implemented yet)")
     args = parser.parse_args()
 
     output_path = Path(args.output_dir)
@@ -247,6 +360,15 @@ def main():
         logger.error(f"Output directory '{output_path}' does not exist or is not a directory.")
         logger.error("Please create it first.")
         return
+
+    # Load sync state
+    sync_state = load_sync_state()
+    
+    if args.dry_run:
+        logger.info("DRY RUN MODE - No files will be created or modified")
+    
+    if args.full_sync:
+        logger.info("FULL SYNC MODE - All documents will be synced regardless of timestamps")
 
     logger.info("Attempting to load credentials...")
     token = load_credentials()
@@ -269,11 +391,24 @@ def main():
     documents = api_response["docs"]
     logger.info(f"Successfully fetched {len(documents)} documents from Granola")
 
+    # Process documents with incremental sync logic
     synced_count = 0
+    updated_count = 0
+    skipped_count = 0
+    
     for doc in documents:
         title = doc.get("title", "Untitled Granola Note")
         doc_id = doc.get("id", "unknown_id")
-        logger.info(f"Processing document: {title} (ID: {doc_id})")
+        
+        # Check if document needs syncing
+        should_sync, reason = needs_sync(doc, sync_state, args.full_sync)
+        
+        if not should_sync:
+            logger.debug(f"Skipping document '{title}' (ID: {doc_id}) - {reason}")
+            skipped_count += 1
+            continue
+            
+        logger.info(f"Processing document: {title} (ID: {doc_id}) - {reason}")
         
         content_to_parse = None
         if doc.get("last_viewed_panel") and \
@@ -289,6 +424,24 @@ def main():
             continue
         
         try:
+            # Generate filename first to check for changes
+            date_prefix = extract_date_from_doc(doc)
+            sanitized_title = sanitize_filename(title)
+            filename = f"{date_prefix} - {sanitized_title}.md"
+            filepath = output_path / filename
+            
+            # Check if this is an update to existing document
+            is_update = doc_id in sync_state.get("documents", {})
+            
+            if args.dry_run:
+                action = "UPDATE" if is_update else "CREATE"
+                logger.info(f"[DRY RUN] Would {action}: {filename}")
+                if is_update:
+                    updated_count += 1
+                else:
+                    synced_count += 1
+                continue
+            
             logger.debug(f"Converting document to markdown: {title}")
             markdown_content = convert_prosemirror_to_markdown(content_to_parse)
             
@@ -319,22 +472,38 @@ def main():
                 final_markdown += "\n\n---\n\n## 📝 Full Transcript\n\n"
                 final_markdown += transcript.strip()
 
-            # Generate filename with date prefix
-            date_prefix = extract_date_from_doc(doc)
-            sanitized_title = sanitize_filename(title)
-            filename = f"{date_prefix} - {sanitized_title}.md"
-            filepath = output_path / filename
+            # Clean up old file if filename changed
+            cleanup_old_file(sync_state, doc_id, filename, output_path)
 
             logger.debug(f"Writing file to: {filepath}")
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(final_markdown)
-            logger.info(f"Successfully saved: {filepath}")
-            synced_count += 1
+            
+            # Update sync state
+            update_sync_state_for_doc(sync_state, doc, filename, bool(transcript))
+            
+            action = "Updated" if is_update else "Created"
+            logger.info(f"{action}: {filepath}")
+            
+            if is_update:
+                updated_count += 1
+            else:
+                synced_count += 1
+                
         except Exception as e:
             logger.error(f"Error processing document '{title}' (ID: {doc_id}): {str(e)}")
             logger.debug("Full traceback:", exc_info=True)
 
-    logger.info(f"Sync complete. {synced_count} notes saved to '{output_path}'")
+    # Save sync state
+    if not args.dry_run:
+        save_sync_state(sync_state)
+
+    # Report sync statistics
+    total_processed = synced_count + updated_count
+    logger.info(f"Sync complete! Created: {synced_count}, Updated: {updated_count}, Skipped: {skipped_count}, Total processed: {total_processed}")
+    
+    if args.dry_run:
+        logger.info("DRY RUN - No actual changes were made")
 
 if __name__ == "__main__":
     main()

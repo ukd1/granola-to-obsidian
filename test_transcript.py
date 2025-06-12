@@ -124,7 +124,7 @@ def test_transcript_segment_parsing(transcript_data):
         
         # Test different field name variations
         text_fields = ['text', 'content', 'transcript']
-        speaker_fields = ['speaker', 'speaker_name', 'speakerName', 'id']
+        speaker_fields = ['speaker', 'speaker_name', 'speakerName']
         time_fields = ['start_time', 'startTime', 'startTimestamp', 'start_timestamp', 'timestamp']
         end_time_fields = ['end_time', 'endTime', 'endTimestamp', 'end_timestamp']
         
