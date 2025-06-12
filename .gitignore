@@ -1,2 +1,4 @@
 *.log
 .granola_sync_state.json
+
+venv/
