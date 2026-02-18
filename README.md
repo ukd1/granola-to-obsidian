@@ -8,15 +8,16 @@ Original script based on this article: https://josephthacker.com/hacking/2025/05
 ## Features
 
 - 🔄 **Incremental Sync**: Only syncs new or updated documents
+- 📚 **Full History Pagination**: Fetches all available documents, not just the first page
 - 📝 **Full Transcript Support**: Includes meeting transcripts in formatted sections
 - 📅 **Date Prefixed Filenames**: Files named as "YYYY-MM-DD - [title].md"
-- 🎯 **Smart State Tracking**: Remembers what's been synced to avoid duplicates
+- 🧭 **Frontmatter-Based Tracking**: Uses each note's `granola_id` frontmatter, no extra state file
 - 🔍 **Dry Run Mode**: Preview changes before syncing
 - 📊 **Detailed Logging**: Clear reporting of what was synced, updated, or skipped
 
 ## Prerequisites
 
-- Python 3.7+
+- Python 3.13+
 - Active Granola account with documents
 - Granola desktop app installed (for credentials)
 
@@ -29,63 +30,28 @@ git clone <repository-url>
 cd granola2obsidian
 ```
 
-### 2. Automated Setup
+### 2. Install Dependencies
 
-Run the setup script to create a virtual environment and install dependencies:
-
-```bash
-./setup.sh
-```
-
-### 3. Manual Setup (Alternative)
+Install dependencies using `uv`:
 
 ```bash
-# Create virtual environment
-python3 -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+uv sync
 ```
-
-## Testing
-
-### Test Transcript API
-
-Use the included test script to verify your setup and see transcript data structure:
-
-```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Run transcript API test
-python test_transcript.py
-```
-
-This will:
-- Load your Granola credentials
-- Fetch your recent documents
-- Test the transcript API with sample data
-- Show you the exact format of transcript segments
 
 ## Usage
 
 ### Basic Sync
 
 ```bash
-# Activate virtual environment (if not already active)
-source venv/bin/activate
 
 # Sync to your Obsidian folder
-python main.py /path/to/your/obsidian/folder
+uv run main.py /path/to/your/obsidian/folder
 ```
 
 ### Command Line Options
 
 ```bash
-python main.py [OPTIONS] OUTPUT_DIR
+uv run main.py [OPTIONS] OUTPUT_DIR
 ```
 
 **Positional Arguments:**
@@ -96,61 +62,50 @@ python main.py [OPTIONS] OUTPUT_DIR
 - `--full-sync`: Force sync all documents (ignore timestamps)
 - `--clean`: Remove local files for documents deleted from Granola *(not implemented yet)*
 
+**Environment Variables:**
+- `LOG_LEVEL`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). Defaults to `DEBUG`.
+
 ### Examples
 
 ```bash
 # Daily incremental sync (recommended)
-python main.py ~/Documents/MyVault/Granola_Notes
+uv run main.py ~/Documents/MyVault/Granola_Notes
 
 # Preview changes before syncing
-python main.py --dry-run ~/Documents/MyVault/Granola_Notes
+uv run main.py --dry-run ~/Documents/MyVault/Granola_Notes
 
 # Force sync all documents
-python main.py --full-sync ~/Documents/MyVault/Granola_Notes
+uv run main.py --full-sync ~/Documents/MyVault/Granola_Notes
 ```
 
-## Sync State Management
+## Frontmatter Indexing
 
-The script maintains a `.granola_sync_state.json` file in the current working directory to track:
+The script scans existing markdown files in your output folder and builds an in-memory index from frontmatter:
 
-- Document IDs and their last update timestamps
-- Local filename mappings
-- Transcript availability status
-- Last sync run timestamp
+- `granola_id` (required for matching)
+- `updated_at` (or `created_at` fallback for incremental comparison)
 
 ### Sync Logic
 
-- **New documents**: Synced automatically
-- **Updated documents**: Only synced when Granola's `updated_at` timestamp is newer than last sync
+- **New documents**: Synced when no local note has matching `granola_id`
+- **Updated documents**: Synced when Granola's `updated_at` is newer than local frontmatter `updated_at`
 - **Unchanged documents**: Skipped entirely (no API calls made)
-- **Renamed documents**: Old files are automatically cleaned up
-
-### Sample Sync State File
-
-```json
-{
-  "last_sync_run": "2024-01-15T10:30:00.123456",
-  "documents": {
-    "doc_123": {
-      "granola_updated_at": "2024-01-15T09:45:00Z",
-      "last_synced_at": "2024-01-15T10:30:00.123456",
-      "local_filename": "2024-01-15 - Team_Meeting.md",
-      "has_transcript": true,
-      "title": "Team Meeting"
-    }
-  }
-}
-```
+- **Renamed local files**: Preserved; updates are written back to the file matched by `granola_id`
 
 ## Output Format
 
 ### File Naming
 
-Files are saved with date prefixes: `YYYY-MM-DD - [sanitized_title].md`
+Files are saved under date folders:
+`YYYY/MM/DD/YYYY-MM-DD - [sanitized_title].md`
+
+If transcript data is available, a sidecar JSON file is also saved as:
+`YYYY/MM/DD/YYYY-MM-DD - [sanitized_title].transcript.json`
 
 Examples:
-- `2024-01-15 - Team_Meeting_Notes.md`
-- `2024-01-16 - Project_Review.md`
+- `2024/01/15/2024-01-15 - Team_Meeting_Notes.md`
+- `2024/01/16/2024-01-16 - Project_Review.md`
+- `2024/01/15/2024-01-15 - Team_Meeting_Notes.transcript.json`
 
 ### Document Structure
 
@@ -171,7 +126,7 @@ has_transcript: true
 
 ---
 
-## 📝 Full Transcript
+## Transcript
 
 **John Smith** [01:23]: Let's start with the quarterly review.
 
@@ -184,6 +139,7 @@ The script automatically loads credentials from Granola's configuration:
 - **Location**: `~/Library/Application Support/Granola/supabase.json`
 - **Required**: Active Granola desktop app installation
 - **No manual configuration needed**
+- **Supported token formats**: `workos_tokens` (current) and `cognito_tokens` (legacy)
 
 ## Logging
 
@@ -209,6 +165,15 @@ The script creates detailed logs in `granola_sync.log` including:
    - Run the test script to see actual API response format
    - Check logs for detailed error information
 
+4. **"No access token found in credentials file"**
+   - Verify `~/Library/Application Support/Granola/supabase.json` exists
+   - Confirm it contains either `workos_tokens` or `cognito_tokens`
+   - Sign out/in of Granola desktop app to refresh credentials if needed
+
+5. **"Skipping document ... no suitable content found in 'last_viewed_panel'"**
+   - Some docs may not have note-body content in the documents response
+   - This is expected for some records and those docs are skipped safely
+
 ### Debug Mode
 
 For detailed debugging, check the log file:
@@ -217,22 +182,18 @@ For detailed debugging, check the log file:
 tail -f granola_sync.log
 ```
 
-### Reset Sync State
+### Force Re-Sync
 
 To force a complete re-sync of all documents:
 
 ```bash
-# Delete sync state file
-rm .granola_sync_state.json
-
-# Run full sync
-python main.py /path/to/your/obsidian/folder
+uv run main.py --full-sync /path/to/your/obsidian/folder
 ```
 
 ## Daily Usage Workflow
 
 1. **Set up once**: Install and test the script
-2. **Daily run**: Execute `python main.py ~/path/to/vault/Granola_Notes`
+2. **Daily run**: Execute `uv run main.py ~/path/to/vault/Granola_Notes`
 3. **Check results**: Review the sync statistics in the output
 4. **Open Obsidian**: Your new/updated notes are ready!
 
@@ -243,14 +204,12 @@ The incremental sync makes daily usage fast - typically only processing a few ne
 ```
 granola2obsidian/
 ├── main.py                      # Main sync script
-├── test_transcript.py          # Test script for API
-├── setup.sh                   # Automated setup script
-├── requirements.txt           # Python dependencies
-├── .granola_sync_state.json  # Sync state (created after first run)
+├── pyproject.toml             # Project dependencies and metadata
+├── uv.lock                    # Locked dependency versions
 ├── granola_sync.log          # Detailed logs
 └── README.md                 # This file
 ```
 
 ## Contributing
 
-Feel free to submit issues, feature requests, or pull requests to improve the script! 
+Feel free to submit issues, feature requests, or pull requests to improve the script!

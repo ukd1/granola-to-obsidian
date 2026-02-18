@@ -1,22 +1,76 @@
 import argparse
-import logging
-from pathlib import Path
-import traceback
 import json
+import logging
 import os
-import requests
 from datetime import datetime
+from pathlib import Path
+
+import requests
+
+
+def get_log_level():
+    """
+    Resolve LOG_LEVEL env var to a valid logging level.
+    Accepts names like DEBUG/INFO/WARNING/ERROR/CRITICAL.
+    """
+    raw_value = os.getenv("LOG_LEVEL", "DEBUG").strip()
+    normalized = raw_value.upper()
+    level = getattr(logging, normalized, None)
+    if isinstance(level, int):
+        return level, normalized
+    return logging.DEBUG, normalized
+
+
+resolved_log_level, requested_log_level = get_log_level()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('granola_sync.log'),
-        logging.StreamHandler()
-    ]
+    level=resolved_log_level,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("granola_sync.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+if resolved_log_level == logging.DEBUG and requested_log_level != "DEBUG":
+    logger.warning(
+        f"Invalid LOG_LEVEL '{requested_log_level}'. Falling back to DEBUG."
+    )
+
+
+def extract_access_token(data):
+    """
+    Extract access token from known Granola credential shapes.
+    Supports legacy `cognito_tokens` and newer `workos_tokens`.
+    """
+    for key in ("workos_tokens", "cognito_tokens"):
+        token_payload = data.get(key)
+        if not token_payload:
+            continue
+
+        try:
+            token_data = (
+                json.loads(token_payload)
+                if isinstance(token_payload, str)
+                else token_payload
+            )
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse token payload from '{key}'")
+            continue
+
+        if isinstance(token_data, dict):
+            access_token = token_data.get("access_token")
+            if access_token:
+                logger.debug(f"Loaded access token from '{key}'")
+                return access_token
+
+    # Fallback if a future schema stores token at the top level.
+    access_token = data.get("access_token")
+    if access_token:
+        logger.debug("Loaded access token from top-level field")
+        return access_token
+
+    return None
+
 
 def load_credentials():
     """
@@ -26,28 +80,30 @@ def load_credentials():
     if not creds_path.exists():
         logger.error(f"Credentials file not found at: {creds_path}")
         return None
-    
+
     try:
-        with open(creds_path, 'r') as f:
+        with open(creds_path, "r") as f:
             data = json.load(f)
-            
-        # Parse the cognito_tokens string into a dict
-        cognito_tokens = json.loads(data['cognito_tokens'])
-        access_token = cognito_tokens.get('access_token')
-        
+
+        access_token = extract_access_token(data)
+
         if not access_token:
-            logger.error("No access token found in credentials file")
+            available_keys = ", ".join(sorted(data.keys()))
+            logger.error(
+                f"No access token found in credentials file. Available keys: {available_keys}"
+            )
             return None
-            
+
         logger.debug("Successfully loaded credentials")
         return access_token
     except Exception as e:
         logger.error(f"Error reading credentials file: {str(e)}")
         return None
 
+
 def fetch_granola_documents(token):
     """
-    Fetch documents from Granola API
+    Fetch all documents from Granola API with pagination.
     """
     url = "https://api.granola.ai/v2/get-documents"
     headers = {
@@ -55,26 +111,98 @@ def fetch_granola_documents(token):
         "Content-Type": "application/json",
         "Accept": "*/*",
         "User-Agent": "Granola/5.354.0",
-        "X-Client-Version": "5.354.0"
+        "X-Client-Version": "5.354.0",
     }
-    data = {
-        "limit": 100,
-        "offset": 0,
-        "include_last_viewed_panel": True
-    }
-    
+    page_size = 100
+    max_pages = 1000
+    offset = 0
+    page_index = 0
+    all_docs = []
+    all_deleted = []
+    seen_doc_ids = set()
+    seen_deleted_ids = set()
+
     try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()
+        while page_index < max_pages:
+            data = {
+                "limit": page_size,
+                "offset": offset,
+                "include_last_viewed_panel": True,
+            }
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                logger.error(
+                    f"Unexpected documents payload type: {type(payload)} at offset {offset}"
+                )
+                return None
+
+            page_docs = payload.get("docs")
+            if not isinstance(page_docs, list):
+                logger.error(
+                    f"Unexpected 'docs' type: {type(page_docs)} at offset {offset}"
+                )
+                return None
+
+            page_deleted = payload.get("deleted", [])
+            if not isinstance(page_deleted, list):
+                page_deleted = []
+
+            new_docs_in_page = 0
+            for doc in page_docs:
+                if not isinstance(doc, dict):
+                    continue
+
+                doc_id = doc.get("id")
+                if doc_id and doc_id in seen_doc_ids:
+                    continue
+
+                if doc_id:
+                    seen_doc_ids.add(doc_id)
+                all_docs.append(doc)
+                new_docs_in_page += 1
+
+            for deleted_id in page_deleted:
+                deleted_key = str(deleted_id)
+                if deleted_key in seen_deleted_ids:
+                    continue
+                seen_deleted_ids.add(deleted_key)
+                all_deleted.append(deleted_id)
+
+            logger.debug(
+                f"Fetched page {page_index + 1}: {len(page_docs)} docs ({new_docs_in_page} new), offset={offset}"
+            )
+
+            if not page_docs:
+                break
+
+            if len(page_docs) < page_size:
+                break
+
+            if new_docs_in_page == 0:
+                logger.warning(
+                    "Pagination yielded no new docs on a full page; stopping to avoid loop"
+                )
+                break
+
+            offset += page_size
+            page_index += 1
+
+        if page_index >= max_pages:
+            logger.warning(f"Reached pagination safety limit ({max_pages} pages)")
+
+        return {"docs": all_docs, "deleted": all_deleted}
     except Exception as e:
         logger.error(f"Error fetching documents: {str(e)}")
         return None
 
+
 def fetch_document_transcript(token, doc_id):
     """
     Fetch transcript for a specific document from Granola API
-    Returns a List[TranscriptSegment] as per API specification
+    Returns (formatted_markdown: str | None, transcript_data: list | None)
     """
     url = f"https://api.granola.ai/v1/get-document-transcript"
     headers = {
@@ -82,41 +210,44 @@ def fetch_document_transcript(token, doc_id):
         "Content-Type": "application/json",
         "Accept": "*/*",
         "User-Agent": "Granola/5.354.0",
-        "X-Client-Version": "5.354.0"
+        "X-Client-Version": "5.354.0",
     }
-    data = {
-        "document_id": doc_id
-    }
-    
+    data = {"document_id": doc_id}
+
     try:
         logger.debug(f"Fetching transcript for document ID: {doc_id}")
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         transcript_data = response.json()
-        
+
         # Debug: Log the actual response structure
         logger.debug(f"Transcript response type: {type(transcript_data)}")
         if isinstance(transcript_data, list):
             logger.debug(f"Transcript segments count: {len(transcript_data)}")
-        
+
         # API should return List[TranscriptSegment]
         if isinstance(transcript_data, list):
-            return format_transcript_segments(transcript_data)
+            return format_transcript_segments(transcript_data), transcript_data
         else:
-            logger.error(f"Unexpected transcript format for document {doc_id} - expected list, got {type(transcript_data)}")
+            logger.error(
+                f"Unexpected transcript format for document {doc_id} - expected list, got {type(transcript_data)}"
+            )
             logger.debug(f"Full response: {transcript_data}")
-            return None
-            
+            return None, None
+
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
             logger.debug(f"No transcript available for document {doc_id}")
-            return None
+            return None, None
         else:
-            logger.error(f"HTTP error fetching transcript for document {doc_id}: {str(e)}")
-            return None
+            logger.error(
+                f"HTTP error fetching transcript for document {doc_id}: {str(e)}"
+            )
+            return None, None
     except Exception as e:
         logger.error(f"Error fetching transcript for document {doc_id}: {str(e)}")
-        return None
+        return None, None
+
 
 def format_transcript_segments(segments):
     """
@@ -125,27 +256,27 @@ def format_transcript_segments(segments):
     """
     if not segments or not isinstance(segments, list):
         return ""
-        
+
     formatted_lines = []
-    
+
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-            
+
         # Extract fields from TranscriptSegment - update these based on actual type definition
-        text = segment.get('text', segment.get('content', ''))
-        speaker = segment.get('speaker', segment.get('speaker_name', ''))
-        start_time = segment.get('start_timestamp', segment.get('startTimestamp', ''))
-        end_time = segment.get('end_timestamp', segment.get('endTimestamp', ''))
-        
+        text = segment.get("text", segment.get("content", ""))
+        speaker = segment.get("speaker", segment.get("speaker_name", ""))
+        start_time = segment.get("start_timestamp", segment.get("startTimestamp", ""))
+        end_time = segment.get("end_timestamp", segment.get("endTimestamp", ""))
+
         if not text:
             continue
-            
+
         # Format the segment based on available information
         if speaker and start_time:
             # Format time if it's a number (seconds) vs string
             if isinstance(start_time, (int, float)):
-                time_str = f"{int(start_time//60):02d}:{int(start_time%60):02d}"
+                time_str = f"{int(start_time // 60):02d}:{int(start_time % 60):02d}"
             else:
                 time_str = str(start_time)
             formatted_lines.append(f"**{speaker}** [{time_str}]: {text}")
@@ -153,55 +284,73 @@ def format_transcript_segments(segments):
             formatted_lines.append(f"**{speaker}**: {text}")
         elif start_time:
             if isinstance(start_time, (int, float)):
-                time_str = f"{int(start_time//60):02d}:{int(start_time%60):02d}"
+                time_str = f"{int(start_time // 60):02d}:{int(start_time % 60):02d}"
             else:
                 time_str = str(start_time)
             formatted_lines.append(f"[{time_str}]: {text}")
         else:
             formatted_lines.append(text)
-    
-    return '\n\n'.join(formatted_lines)
+
+    return "\n\n".join(formatted_lines)
+
 
 def convert_prosemirror_to_markdown(content):
     """
     Convert ProseMirror JSON to Markdown
     """
-    if not content or not isinstance(content, dict) or 'content' not in content:
+    if not content or not isinstance(content, dict) or "content" not in content:
         return ""
-        
+
     markdown = []
-    
+
     def process_node(node):
         if not isinstance(node, dict):
             return ""
-            
-        node_type = node.get('type', '')
-        content = node.get('content', [])
-        text = node.get('text', '')
-        
-        if node_type == 'heading':
-            level = node.get('attrs', {}).get('level', 1)
-            heading_text = ''.join(process_node(child) for child in content)
+
+        node_type = node.get("type", "")
+        content = node.get("content", [])
+        text = node.get("text", "")
+
+        if node_type == "heading":
+            level = node.get("attrs", {}).get("level", 1)
+            heading_text = "".join(process_node(child) for child in content)
             return f"{'#' * level} {heading_text}\n\n"
-            
-        elif node_type == 'paragraph':
-            para_text = ''.join(process_node(child) for child in content)
+
+        elif node_type == "paragraph":
+            para_text = "".join(process_node(child) for child in content)
             return f"{para_text}\n\n"
-            
-        elif node_type == 'bulletList':
+
+        elif node_type == "bulletList":
             items = []
             for item in content:
-                if item.get('type') == 'listItem':
-                    item_content = ''.join(process_node(child) for child in item.get('content', []))
+                if item.get("type") == "listItem":
+                    item_content = "".join(
+                        process_node(child) for child in item.get("content", [])
+                    )
                     items.append(f"- {item_content.strip()}")
-            return '\n'.join(items) + '\n\n'
-            
-        elif node_type == 'text':
+            return "\n".join(items) + "\n\n"
+
+        elif node_type == "text":
             return text
-            
-        return ''.join(process_node(child) for child in content)
-    
+
+        return "".join(process_node(child) for child in content)
+
     return process_node(content)
+
+
+def normalize_title(title):
+    """
+    Return a safe, non-empty title string for filenames/frontmatter.
+    """
+    if isinstance(title, str):
+        normalized = title.strip()
+    elif title is None:
+        normalized = ""
+    else:
+        normalized = str(title).strip()
+
+    return normalized or "Untitled Granola Note"
+
 
 def sanitize_filename(title):
     """
@@ -209,10 +358,12 @@ def sanitize_filename(title):
     """
     # Remove invalid characters
     invalid_chars = '<>:"/\\|?*'
-    filename = ''.join(c for c in title if c not in invalid_chars)
+    safe_title = normalize_title(title)
+    filename = "".join(c for c in safe_title if c not in invalid_chars)
     # Replace spaces with underscores
-    filename = filename.replace(' ', '_')
-    return filename
+    filename = filename.replace(" ", "_")
+    return filename or "Untitled_Granola_Note"
+
 
 def extract_date_from_doc(doc):
     """
@@ -220,155 +371,205 @@ def extract_date_from_doc(doc):
     """
     # Try created_at first, then updated_at as fallback
     date_str = doc.get("created_at") or doc.get("updated_at")
-    
+
     if not date_str:
         # If no date available, use current date
         return datetime.now().strftime("%Y-%m-%d")
-    
+
     try:
         # Parse the ISO date string and format as YYYY-MM-DD
         # Granola dates are typically in ISO format like "2024-01-15T10:30:00Z"
-        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%d")
     except (ValueError, AttributeError):
         logger.warning(f"Could not parse date '{date_str}', using current date")
         return datetime.now().strftime("%Y-%m-%d")
 
-def load_sync_state():
+
+def build_output_relative_path(date_prefix, filename):
     """
-    Load sync state from the current working directory
+    Build output path as YYYY/MM/DD/<existing filename>.
     """
-    sync_state_path = Path('.granola_sync_state.json')
-    
-    if not sync_state_path.exists():
-        logger.info("No existing sync state found - first run or full sync")
-        return {
-            "last_sync_run": None,
-            "documents": {}
-        }
-    
     try:
-        with open(sync_state_path, 'r') as f:
-            sync_state = json.load(f)
-        logger.debug(f"Loaded sync state with {len(sync_state.get('documents', {}))} tracked documents")
-        return sync_state
+        year, month, day = date_prefix.split("-")
+    except ValueError:
+        logger.warning(
+            f"Unexpected date prefix '{date_prefix}', falling back to unsorted root path"
+        )
+        return Path(filename)
+
+    return Path(year) / month / day / filename
+
+
+def parse_frontmatter_file(filepath):
+    """
+    Parse simple YAML frontmatter from a markdown file.
+    This supports scalar `key: value` pairs used by this script.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
     except Exception as e:
-        logger.error(f"Error loading sync state: {str(e)}")
-        logger.info("Starting with empty sync state")
-        return {
-            "last_sync_run": None,
-            "documents": {}
+        logger.warning(f"Could not read markdown file '{filepath}': {str(e)}")
+        return {}
+
+    if len(lines) < 3 or lines[0].strip() != "---":
+        return {}
+
+    frontmatter = {}
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if len(value) >= 2 and (
+            (value[0] == '"' and value[-1] == '"')
+            or (value[0] == "'" and value[-1] == "'")
+        ):
+            value = value[1:-1]
+
+        frontmatter[key] = value
+
+    return frontmatter
+
+
+def build_local_note_index(output_path):
+    """
+    Build an in-memory index of existing notes by granola_id from frontmatter.
+    """
+    notes_by_id = {}
+    duplicate_ids = set()
+
+    for filepath in output_path.rglob("*.md"):
+        frontmatter = parse_frontmatter_file(filepath)
+        granola_id = str(frontmatter.get("granola_id", "")).strip()
+        if not granola_id:
+            continue
+
+        note_entry = {
+            "local_filename": filepath.relative_to(output_path).as_posix(),
+            "granola_updated_at": frontmatter.get("updated_at")
+            or frontmatter.get("created_at"),
+            "path": filepath,
         }
 
-def save_sync_state(sync_state):
-    """
-    Save sync state to the current working directory
-    """
-    sync_state_path = Path('.granola_sync_state.json')
-    
-    try:
-        # Update last sync run timestamp
-        sync_state["last_sync_run"] = datetime.now().isoformat()
-        
-        with open(sync_state_path, 'w') as f:
-            json.dump(sync_state, f, indent=2)
-        logger.debug(f"Saved sync state with {len(sync_state.get('documents', {}))} tracked documents")
-    except Exception as e:
-        logger.error(f"Error saving sync state: {str(e)}")
+        if granola_id in notes_by_id:
+            duplicate_ids.add(granola_id)
+            current_entry = notes_by_id[granola_id]
+            try:
+                use_new_entry = filepath.stat().st_mtime > current_entry["path"].stat().st_mtime
+            except OSError:
+                use_new_entry = False
 
-def needs_sync(doc, sync_state, force_full_sync=False):
+            if use_new_entry:
+                notes_by_id[granola_id] = note_entry
+
+            logger.warning(
+                f"Duplicate granola_id '{granola_id}' found in local notes. Using most recently modified file."
+            )
+            continue
+
+        notes_by_id[granola_id] = note_entry
+
+    if duplicate_ids:
+        logger.warning(
+            f"Found {len(duplicate_ids)} duplicate granola_id values in local markdown files."
+        )
+
+    logger.info(f"Indexed {len(notes_by_id)} existing notes by granola_id")
+    return notes_by_id
+
+
+def needs_sync(doc, local_notes_by_id, force_full_sync=False):
     """
     Determine if a document needs to be synced
     Returns (needs_sync: bool, reason: str)
     """
     if force_full_sync:
         return True, "full-sync requested"
-    
+
     doc_id = doc.get("id")
     if not doc_id:
         return True, "missing document ID"
-    
-    # Check if document exists in sync state
-    if doc_id not in sync_state.get("documents", {}):
+
+    # Check if document exists locally by granola_id frontmatter
+    if doc_id not in local_notes_by_id:
         return True, "new document"
-    
-    doc_state = sync_state["documents"][doc_id]
+
+    doc_state = local_notes_by_id[doc_id]
     granola_updated_at = doc.get("updated_at") or doc.get("created_at")
-    last_synced_updated_at = doc_state.get("granola_updated_at")
-    
+    local_updated_at = doc_state.get("granola_updated_at")
+
     if not granola_updated_at:
         return True, "no timestamp from Granola"
-    
-    if not last_synced_updated_at:
-        return True, "no previous sync timestamp"
-    
+
+    if not local_updated_at:
+        return True, "local note missing updated_at frontmatter"
+
     # Compare timestamps (both should be ISO format strings)
-    if granola_updated_at > last_synced_updated_at:
-        return True, f"document updated ({granola_updated_at} > {last_synced_updated_at})"
-    
+    if granola_updated_at > local_updated_at:
+        return (
+            True,
+            f"document updated ({granola_updated_at} > {local_updated_at})",
+        )
+
     return False, "document unchanged"
 
-def update_sync_state_for_doc(sync_state, doc, filename, has_transcript):
-    """
-    Update sync state for a successfully synced document
-    """
-    doc_id = doc.get("id")
-    if not doc_id:
-        return
-    
-    if "documents" not in sync_state:
-        sync_state["documents"] = {}
-    
-    sync_state["documents"][doc_id] = {
-        "granola_updated_at": doc.get("updated_at") or doc.get("created_at"),
-        "last_synced_at": datetime.now().isoformat(),
-        "local_filename": filename,
-        "has_transcript": has_transcript,
-        "title": doc.get("title", "Untitled")
-    }
-
-def cleanup_old_file(sync_state, doc_id, new_filename, output_path):
-    """
-    Remove old file if document title/filename changed
-    """
-    if doc_id not in sync_state.get("documents", {}):
-        return
-    
-    old_filename = sync_state["documents"][doc_id].get("local_filename")
-    if old_filename and old_filename != new_filename:
-        old_filepath = output_path / old_filename
-        if old_filepath.exists():
-            try:
-                old_filepath.unlink()
-                logger.info(f"Removed old file: {old_filename}")
-            except Exception as e:
-                logger.warning(f"Could not remove old file {old_filename}: {str(e)}")
 
 def main():
     logger.info("Starting Granola sync process")
-    parser = argparse.ArgumentParser(description="Fetch Granola notes and save them as Markdown files in an Obsidian folder.")
-    parser.add_argument("output_dir", type=str, help="The full path to the Obsidian subfolder where notes should be saved.")
-    parser.add_argument("--full-sync", action="store_true", help="Force sync all documents (ignore timestamps)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be synced without making changes")
-    parser.add_argument("--clean", action="store_true", help="Remove local files for documents deleted from Granola (not implemented yet)")
+    parser = argparse.ArgumentParser(
+        description="Fetch Granola notes and save them as Markdown files in an Obsidian folder."
+    )
+    parser.add_argument(
+        "output_dir",
+        type=str,
+        help="The full path to the Obsidian subfolder where notes should be saved.",
+    )
+    parser.add_argument(
+        "--full-sync",
+        action="store_true",
+        help="Force sync all documents (ignore timestamps)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be synced without making changes",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove local files for documents deleted from Granola (not implemented yet)",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output_dir)
     logger.info(f"Output directory set to: {output_path}")
-    
+
     if not output_path.is_dir():
-        logger.error(f"Output directory '{output_path}' does not exist or is not a directory.")
+        logger.error(
+            f"Output directory '{output_path}' does not exist or is not a directory."
+        )
         logger.error("Please create it first.")
         return
 
-    # Load sync state
-    sync_state = load_sync_state()
-    
+    local_notes_by_id = build_local_note_index(output_path)
+
     if args.dry_run:
         logger.info("DRY RUN MODE - No files will be created or modified")
-    
+
     if args.full_sync:
-        logger.info("FULL SYNC MODE - All documents will be synced regardless of timestamps")
+        logger.info(
+            "FULL SYNC MODE - All documents will be synced regardless of timestamps"
+        )
 
     logger.info("Attempting to load credentials...")
     token = load_credentials()
@@ -376,13 +577,15 @@ def main():
         logger.error("Failed to load credentials. Exiting.")
         return
 
-    logger.info("Credentials loaded successfully. Fetching documents from Granola API...")
+    logger.info(
+        "Credentials loaded successfully. Fetching documents from Granola API..."
+    )
     api_response = fetch_granola_documents(token)
 
     if not api_response:
         logger.error("Failed to fetch documents - API response is empty")
         return
-        
+
     if "docs" not in api_response:
         logger.error("API response format is unexpected - 'docs' key not found")
         logger.debug(f"API Response: {api_response}")
@@ -395,115 +598,148 @@ def main():
     synced_count = 0
     updated_count = 0
     skipped_count = 0
-    
+
     for doc in documents:
-        title = doc.get("title", "Untitled Granola Note")
-        doc_id = doc.get("id", "unknown_id")
-        
+        title = normalize_title(doc.get("title"))
+        doc_id = doc.get("id")
+        display_doc_id = doc_id or "unknown_id"
+
         # Check if document needs syncing
-        should_sync, reason = needs_sync(doc, sync_state, args.full_sync)
-        
+        should_sync, reason = needs_sync(doc, local_notes_by_id, args.full_sync)
+
         if not should_sync:
-            logger.debug(f"Skipping document '{title}' (ID: {doc_id}) - {reason}")
+            logger.debug(
+                f"Skipping document '{title}' (ID: {display_doc_id}) - {reason}"
+            )
             skipped_count += 1
             continue
-            
-        logger.info(f"Processing document: {title} (ID: {doc_id}) - {reason}")
-        
+
+        logger.info(
+            f"Processing document: {title} (ID: {display_doc_id}) - {reason}"
+        )
+
         content_to_parse = None
-        if doc.get("last_viewed_panel") and \
-           isinstance(doc["last_viewed_panel"], dict) and \
-           doc["last_viewed_panel"].get("content") and \
-           isinstance(doc["last_viewed_panel"]["content"], dict) and \
-           doc["last_viewed_panel"]["content"].get("type") == "doc":
+        if (
+            doc.get("last_viewed_panel")
+            and isinstance(doc["last_viewed_panel"], dict)
+            and doc["last_viewed_panel"].get("content")
+            and isinstance(doc["last_viewed_panel"]["content"], dict)
+            and doc["last_viewed_panel"]["content"].get("type") == "doc"
+        ):
             content_to_parse = doc["last_viewed_panel"]["content"]
             logger.debug(f"Found content to parse for document: {title}")
 
         if not content_to_parse:
-            logger.warning(f"Skipping document '{title}' (ID: {doc_id}) - no suitable content found in 'last_viewed_panel'")
+            logger.warning(
+                f"Skipping document '{title}' (ID: {display_doc_id}) - no suitable content found in 'last_viewed_panel'"
+            )
             continue
-        
+
         try:
-            # Generate filename first to check for changes
-            date_prefix = extract_date_from_doc(doc)
-            sanitized_title = sanitize_filename(title)
-            filename = f"{date_prefix} - {sanitized_title}.md"
-            filepath = output_path / filename
-            
-            # Check if this is an update to existing document
-            is_update = doc_id in sync_state.get("documents", {})
-            
+            existing_note = local_notes_by_id.get(doc_id) if doc_id else None
+
+            if existing_note:
+                local_relative_filename = existing_note["local_filename"]
+                filepath = output_path / Path(local_relative_filename)
+            else:
+                date_prefix = extract_date_from_doc(doc)
+                sanitized_title = sanitize_filename(title)
+                filename = f"{date_prefix} - {sanitized_title}.md"
+                local_relative_path = build_output_relative_path(date_prefix, filename)
+                local_relative_filename = local_relative_path.as_posix()
+                filepath = output_path / local_relative_path
+
+            transcript_json_path = filepath.with_suffix(".transcript.json")
+            is_update = existing_note is not None
+
             if args.dry_run:
                 action = "UPDATE" if is_update else "CREATE"
-                logger.info(f"[DRY RUN] Would {action}: {filename}")
+                logger.info(f"[DRY RUN] Would {action}: {local_relative_filename}")
                 if is_update:
                     updated_count += 1
                 else:
                     synced_count += 1
                 continue
-            
+
             logger.debug(f"Converting document to markdown: {title}")
             markdown_content = convert_prosemirror_to_markdown(content_to_parse)
-            
+
             # Fetch transcript for this document
-            transcript = fetch_document_transcript(token, doc_id)
-            
+            transcript_markdown, transcript_data = fetch_document_transcript(
+                token, doc_id
+            )
+
             # Add a frontmatter block for metadata
             frontmatter = f"---\n"
-            frontmatter += f"granola_id: {doc_id}\n"
-            escaped_title_for_yaml = title.replace('"', '\\"') 
+            frontmatter += f"granola_id: {doc_id or ''}\n"
+            escaped_title_for_yaml = title.replace('"', '\\"')
             frontmatter += f'title: "{escaped_title_for_yaml}"\n'
-            
+
             if doc.get("created_at"):
                 frontmatter += f"created_at: {doc.get('created_at')}\n"
             if doc.get("updated_at"):
                 frontmatter += f"updated_at: {doc.get('updated_at')}\n"
-            
+
             # Add transcript availability to frontmatter
-            frontmatter += f"has_transcript: {'true' if transcript else 'false'}\n"
+            frontmatter += (
+                f"has_transcript: {'true' if transcript_data else 'false'}\n"
+            )
             frontmatter += f"---\n\n"
-            
+
             # Build the final markdown content
             final_markdown = frontmatter + markdown_content
-            
-            # Add transcript section if available
-            if transcript:
-                logger.debug(f"Adding transcript section for document: {title}")
-                final_markdown += "\n\n---\n\n## 📝 Full Transcript\n\n"
-                final_markdown += transcript.strip()
 
-            # Clean up old file if filename changed
-            cleanup_old_file(sync_state, doc_id, filename, output_path)
+            # Add transcript section if available
+            if transcript_markdown:
+                logger.debug(f"Adding transcript section for document: {title}")
+                final_markdown += "\n\n---\n\n## Transcript\n\n"
+                final_markdown += transcript_markdown.strip()
 
             logger.debug(f"Writing file to: {filepath}")
-            with open(filepath, 'w', encoding='utf-8') as f:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
                 f.write(final_markdown)
-            
-            # Update sync state
-            update_sync_state_for_doc(sync_state, doc, filename, bool(transcript))
-            
+
+            if transcript_data is not None:
+                logger.debug(f"Writing transcript sidecar to: {transcript_json_path}")
+                with open(transcript_json_path, "w", encoding="utf-8") as f:
+                    json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+            elif transcript_json_path.exists():
+                logger.debug(f"Removing stale transcript sidecar: {transcript_json_path}")
+                transcript_json_path.unlink()
+
+            # Update in-memory local index so this run can make consistent decisions
+            if doc_id:
+                local_notes_by_id[doc_id] = {
+                    "local_filename": local_relative_filename,
+                    "granola_updated_at": doc.get("updated_at")
+                    or doc.get("created_at"),
+                    "path": filepath,
+                }
+
             action = "Updated" if is_update else "Created"
             logger.info(f"{action}: {filepath}")
-            
+
             if is_update:
                 updated_count += 1
             else:
                 synced_count += 1
-                
-        except Exception as e:
-            logger.error(f"Error processing document '{title}' (ID: {doc_id}): {str(e)}")
-            logger.debug("Full traceback:", exc_info=True)
 
-    # Save sync state
-    if not args.dry_run:
-        save_sync_state(sync_state)
+        except Exception as e:
+            logger.error(
+                f"Error processing document '{title}' (ID: {display_doc_id}): {str(e)}"
+            )
+            logger.debug("Full traceback:", exc_info=True)
 
     # Report sync statistics
     total_processed = synced_count + updated_count
-    logger.info(f"Sync complete! Created: {synced_count}, Updated: {updated_count}, Skipped: {skipped_count}, Total processed: {total_processed}")
-    
+    logger.info(
+        f"Sync complete! Created: {synced_count}, Updated: {updated_count}, Skipped: {skipped_count}, Total processed: {total_processed}"
+    )
+
     if args.dry_run:
         logger.info("DRY RUN - No actual changes were made")
+
 
 if __name__ == "__main__":
     main()
