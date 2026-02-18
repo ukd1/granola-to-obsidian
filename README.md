@@ -91,6 +91,7 @@ The script scans existing markdown files in your output folder and builds an in-
 - **Updated documents**: Synced when Granola's `updated_at` is newer than local frontmatter `updated_at`
 - **Unchanged documents**: Skipped entirely (no API calls made)
 - **Renamed local files**: Preserved; updates are written back to the file matched by `granola_id`
+- **Transcript sidecars**: Indexed by document ID and renamed to match note filename changes when possible
 
 ## Output Format
 
@@ -103,9 +104,9 @@ If transcript data is available, a sidecar JSON file is also saved as:
 `YYYY/MM/DD/YYYY-MM-DD - [sanitized_title].transcript.json`
 
 Examples:
-- `2024/01/15/2024-01-15 - Team_Meeting_Notes.md`
-- `2024/01/16/2024-01-16 - Project_Review.md`
-- `2024/01/15/2024-01-15 - Team_Meeting_Notes.transcript.json`
+- `2024/01/15/2024-01-15 - Team Meeting Notes.md`
+- `2024/01/16/2024-01-16 - Project Review.md`
+- `2024/01/15/2024-01-15 - Team Meeting Notes.transcript.json`
 
 ### Document Structure
 

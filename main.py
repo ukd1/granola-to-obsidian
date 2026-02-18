@@ -360,9 +360,7 @@ def sanitize_filename(title):
     invalid_chars = '<>:"/\\|?*'
     safe_title = normalize_title(title)
     filename = "".join(c for c in safe_title if c not in invalid_chars)
-    # Replace spaces with underscores
-    filename = filename.replace(" ", "_")
-    return filename or "Untitled_Granola_Note"
+    return filename or "Untitled Granola Note"
 
 
 def extract_date_from_doc(doc):
@@ -488,6 +486,129 @@ def build_local_note_index(output_path):
     return notes_by_id
 
 
+def build_generated_note_relative_path(doc):
+    """
+    Build the default generated relative note path for a Granola document.
+    """
+    title = normalize_title(doc.get("title"))
+    date_prefix = extract_date_from_doc(doc)
+    sanitized_title = sanitize_filename(title)
+    filename = f"{date_prefix} - {sanitized_title}.md"
+    return build_output_relative_path(date_prefix, filename)
+
+
+def build_transcript_file_index(output_path, documents, local_notes_by_id):
+    """
+    Build a mapping of document ID -> transcript sidecar path.
+    Preference order:
+    1) sidecar next to the currently indexed local note path
+    2) sidecar at the script's generated default path for this doc
+    """
+    transcript_files_by_id = {}
+    matched_transcript_paths = set()
+    all_transcript_paths = set(output_path.rglob("*.transcript.json"))
+
+    for doc in documents:
+        doc_id = doc.get("id")
+        if not doc_id:
+            continue
+
+        candidate_paths = []
+        local_note = local_notes_by_id.get(doc_id)
+        if local_note:
+            local_note_path = output_path / Path(local_note["local_filename"])
+            candidate_paths.append(local_note_path.with_suffix(".transcript.json"))
+
+        generated_note_path = output_path / build_generated_note_relative_path(doc)
+        candidate_paths.append(generated_note_path.with_suffix(".transcript.json"))
+
+        existing_candidates = []
+        seen = set()
+        for candidate in candidate_paths:
+            candidate_key = candidate.as_posix()
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            if candidate.exists():
+                existing_candidates.append(candidate)
+
+        if not existing_candidates:
+            continue
+
+        selected_path = existing_candidates[0]
+        if len(existing_candidates) > 1:
+            logger.warning(
+                f"Multiple transcript sidecars found for document ID {doc_id}. Using {selected_path}"
+            )
+
+        transcript_files_by_id[doc_id] = selected_path
+        matched_transcript_paths.add(selected_path)
+
+    unmatched_transcript_count = len(all_transcript_paths - matched_transcript_paths)
+    if unmatched_transcript_count:
+        logger.warning(
+            f"Found {unmatched_transcript_count} transcript sidecar files that could not be matched to a document ID"
+        )
+
+    logger.info(
+        f"Indexed {len(transcript_files_by_id)} transcript sidecar files by document ID"
+    )
+    return transcript_files_by_id
+
+
+def reconcile_transcript_paths(
+    output_path, local_notes_by_id, transcript_files_by_id, dry_run=False
+):
+    """
+    Ensure each note's transcript sidecar path matches the note's current filename.
+    Renames sidecars when a note has been renamed locally.
+    """
+    renamed_count = 0
+
+    for doc_id, note_entry in local_notes_by_id.items():
+        actual_transcript_path = transcript_files_by_id.get(doc_id)
+        if not actual_transcript_path:
+            continue
+
+        expected_note_path = output_path / Path(note_entry["local_filename"])
+        expected_transcript_path = expected_note_path.with_suffix(".transcript.json")
+        if actual_transcript_path == expected_transcript_path:
+            continue
+
+        if expected_transcript_path.exists():
+            logger.warning(
+                f"Expected transcript path already exists for document ID {doc_id}; leaving existing file at {actual_transcript_path}"
+            )
+            continue
+
+        if dry_run:
+            logger.info(
+                f"[DRY RUN] Would rename transcript sidecar for document ID {doc_id}: {actual_transcript_path} -> {expected_transcript_path}"
+            )
+            renamed_count += 1
+            continue
+
+        try:
+            expected_transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_transcript_path.rename(expected_transcript_path)
+            transcript_files_by_id[doc_id] = expected_transcript_path
+            logger.info(
+                f"Renamed transcript sidecar for document ID {doc_id}: {actual_transcript_path} -> {expected_transcript_path}"
+            )
+            renamed_count += 1
+        except Exception as e:
+            logger.warning(
+                f"Could not rename transcript sidecar for document ID {doc_id}: {str(e)}"
+            )
+
+    if renamed_count:
+        logger.info(
+            f"{'[DRY RUN] ' if dry_run else ''}Transcript sidecar rename checks: {renamed_count} {'would be ' if dry_run else ''}renamed"
+        )
+
+    return renamed_count
+
+
 def needs_sync(doc, local_notes_by_id, force_full_sync=False):
     """
     Determine if a document needs to be synced
@@ -594,6 +715,13 @@ def main():
     documents = api_response["docs"]
     logger.info(f"Successfully fetched {len(documents)} documents from Granola")
 
+    transcript_files_by_id = build_transcript_file_index(
+        output_path, documents, local_notes_by_id
+    )
+    reconcile_transcript_paths(
+        output_path, local_notes_by_id, transcript_files_by_id, args.dry_run
+    )
+
     # Process documents with incremental sync logic
     synced_count = 0
     updated_count = 0
@@ -636,10 +764,7 @@ def main():
                 local_relative_filename = existing_note["local_filename"]
                 filepath = output_path / Path(local_relative_filename)
             else:
-                date_prefix = extract_date_from_doc(doc)
-                sanitized_title = sanitize_filename(title)
-                filename = f"{date_prefix} - {sanitized_title}.md"
-                local_relative_path = build_output_relative_path(date_prefix, filename)
+                local_relative_path = build_generated_note_relative_path(doc)
                 local_relative_filename = local_relative_path.as_posix()
                 filepath = output_path / local_relative_path
 
