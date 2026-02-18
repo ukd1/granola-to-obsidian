@@ -162,7 +162,7 @@ The script creates detailed logs in `granola_sync.log` including:
    - Only meeting recordings generate transcripts
 
 3. **"Unexpected transcript format"**
-   - Run the test script to see actual API response format
+   - Inspect `granola_sync.log` for the raw response shape logged by the script
    - Check logs for detailed error information
 
 4. **"No access token found in credentials file"**
@@ -170,9 +170,10 @@ The script creates detailed logs in `granola_sync.log` including:
    - Confirm it contains either `workos_tokens` or `cognito_tokens`
    - Sign out/in of Granola desktop app to refresh credentials if needed
 
-5. **"Skipping document ... no suitable content found in 'last_viewed_panel'"**
+5. **"Skipping document ... no suitable content found in 'last_viewed_panel' and no transcript available"**
    - Some docs may not have note-body content in the documents response
-   - This is expected for some records and those docs are skipped safely
+   - The script now falls back to transcript-only export when transcript data exists
+   - This warning means neither note-body content nor transcript data was available
 
 ### Debug Mode
 

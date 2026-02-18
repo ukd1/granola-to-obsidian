@@ -629,12 +629,6 @@ def main():
             content_to_parse = doc["last_viewed_panel"]["content"]
             logger.debug(f"Found content to parse for document: {title}")
 
-        if not content_to_parse:
-            logger.warning(
-                f"Skipping document '{title}' (ID: {display_doc_id}) - no suitable content found in 'last_viewed_panel'"
-            )
-            continue
-
         try:
             existing_note = local_notes_by_id.get(doc_id) if doc_id else None
 
@@ -653,21 +647,52 @@ def main():
             is_update = existing_note is not None
 
             if args.dry_run:
+                if not content_to_parse:
+                    transcript_markdown, transcript_data = (
+                        fetch_document_transcript(token, doc_id)
+                        if doc_id
+                        else (None, None)
+                    )
+                    if not transcript_data:
+                        logger.warning(
+                            f"[DRY RUN] Would SKIP document '{title}' (ID: {display_doc_id}) - no suitable content found in 'last_viewed_panel' and no transcript available"
+                        )
+                        skipped_count += 1
+                        continue
+
                 action = "UPDATE" if is_update else "CREATE"
-                logger.info(f"[DRY RUN] Would {action}: {local_relative_filename}")
+                if content_to_parse:
+                    logger.info(f"[DRY RUN] Would {action}: {local_relative_filename}")
+                else:
+                    logger.info(
+                        f"[DRY RUN] Would {action} (transcript-only): {local_relative_filename}"
+                    )
                 if is_update:
                     updated_count += 1
                 else:
                     synced_count += 1
                 continue
 
-            logger.debug(f"Converting document to markdown: {title}")
-            markdown_content = convert_prosemirror_to_markdown(content_to_parse)
+            if content_to_parse:
+                logger.debug(f"Converting document to markdown: {title}")
+                markdown_content = convert_prosemirror_to_markdown(content_to_parse)
+            else:
+                logger.info(
+                    f"No suitable content found in 'last_viewed_panel' for '{title}' (ID: {display_doc_id}); attempting transcript-only export"
+                )
+                markdown_content = ""
 
             # Fetch transcript for this document
-            transcript_markdown, transcript_data = fetch_document_transcript(
-                token, doc_id
+            transcript_markdown, transcript_data = (
+                fetch_document_transcript(token, doc_id) if doc_id else (None, None)
             )
+
+            if not content_to_parse and not transcript_data:
+                logger.warning(
+                    f"Skipping document '{title}' (ID: {display_doc_id}) - no suitable content found in 'last_viewed_panel' and no transcript available"
+                )
+                skipped_count += 1
+                continue
 
             # Add a frontmatter block for metadata
             frontmatter = f"---\n"
@@ -687,12 +712,22 @@ def main():
             frontmatter += f"---\n\n"
 
             # Build the final markdown content
-            final_markdown = frontmatter + markdown_content
+            final_markdown = frontmatter
+            if markdown_content:
+                final_markdown += markdown_content
+            else:
+                final_markdown += f"# {title}\n\n"
+                final_markdown += (
+                    "_Transcript-only export (note body unavailable from Granola API)._"
+                )
 
             # Add transcript section if available
             if transcript_markdown:
                 logger.debug(f"Adding transcript section for document: {title}")
-                final_markdown += "\n\n---\n\n## Transcript\n\n"
+                if markdown_content:
+                    final_markdown += "\n\n---\n\n## Transcript\n\n"
+                else:
+                    final_markdown += "\n\n## Transcript\n\n"
                 final_markdown += transcript_markdown.strip()
 
             logger.debug(f"Writing file to: {filepath}")
