@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -15,18 +16,23 @@ import (
 	"github.com/charmbracelet/log"
 )
 
+var (
+	invalidFilenameChars = regexp.MustCompile(`[<>:"/\\|?*]`)
+	ansiEscape           = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+)
+
 type TranscriptSegment struct {
-	Text         string `json:"text"`
-	Speaker      string `json:"speaker"`
+	Text           string `json:"text"`
+	Speaker        string `json:"speaker"`
 	StartTimestamp any    `json:"start_timestamp"`
 	EndTimestamp   any    `json:"end_timestamp"`
 }
 
 type ProseMirrorContent struct {
-	Type     string                 `json:"type"`
-	Content  []ProseMirrorContent   `json:"content,omitempty"`
-	Attrs    map[string]any         `json:"attrs,omitempty"`
-	Text     string                 `json:"text,omitempty"`
+	Type    string               `json:"type"`
+	Content []ProseMirrorContent `json:"content,omitempty"`
+	Attrs   map[string]any       `json:"attrs,omitempty"`
+	Text    string               `json:"text,omitempty"`
 }
 
 type GranolaDocument struct {
@@ -38,48 +44,70 @@ type GranolaDocument struct {
 }
 
 type DocumentsResponse struct {
-	Docs     []GranolaDocument `json:"docs"`
-	Deleted  []any             `json:"deleted,omitempty"`
+	Docs []GranolaDocument `json:"docs"`
+}
+
+type LocalNote struct {
+	LocalFilename    string
+	GranolaUpdatedAt string
+	Path             string
+}
+
+// teeWriter writes to both a terminal and a log file, preserving the
+// terminal file descriptor so charmbracelet/log retains color detection.
+// ANSI escape codes are stripped from file output.
+type teeWriter struct {
+	terminal *os.File
+	file     *os.File
+}
+
+func (w *teeWriter) Write(p []byte) (n int, err error) {
+	n, err = w.terminal.Write(p)
+	if w.file != nil {
+		clean := ansiEscape.ReplaceAll(p, nil)
+		w.file.Write(clean)
+	}
+	return
+}
+
+func (w *teeWriter) Fd() uintptr {
+	return w.terminal.Fd()
 }
 
 func main() {
-	outputDir := ""
 	fullSync := false
 	dryRun := false
-	clean := false
 
-	args := os.Args[1:]
-	for i, arg := range args {
+	var positionalArgs []string
+	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "--full-sync":
 			fullSync = true
 		case "--dry-run":
 			dryRun = true
-		case "--clean":
-			clean = true
 		default:
-			if i == len(args)-1 && !strings.HasPrefix(arg, "-") {
-				outputDir = arg
+			if !strings.HasPrefix(arg, "-") {
+				positionalArgs = append(positionalArgs, arg)
 			}
 		}
 	}
 
-	if outputDir == "" {
+	if len(positionalArgs) != 1 {
 		log.Fatal("Usage: granola-sync [OPTIONS] OUTPUT_DIR")
 	}
 
-	outputPath := filepath.Clean(outputDir)
+	outputPath := filepath.Clean(positionalArgs[0])
 	if err := validateOutputDir(outputPath); err != nil {
 		log.Fatal(err)
 	}
 
-	// Set up log file output (write to both stderr and file)
-	logFile, err := os.OpenFile("granola_sync.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Set up dual logging: styled terminal output + clean log file
+	logFile, err := os.OpenFile("granola_sync.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		log.Warn("Could not open log file", "err", err)
 	} else {
 		defer logFile.Close()
-		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+		log.SetOutput(&teeWriter{terminal: os.Stderr, file: logFile})
 	}
 
 	if lvl := os.Getenv("LOG_LEVEL"); lvl != "" {
@@ -92,25 +120,24 @@ func main() {
 		}
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client := &http.Client{Timeout: 60 * time.Second}
+
 	log.Info("Starting Granola sync process")
 
-	localNotes, err := buildLocalNoteIndex(outputPath)
+	localNotes, transcriptPaths, err := walkOutputDir(outputPath)
 	if err != nil {
-		log.Error("Error building local note index", "err", err)
+		log.Error("Error scanning output directory", "err", err)
 	}
 
 	if dryRun {
 		log.Info("DRY RUN MODE - No files will be created or modified")
 	}
-
 	if fullSync {
 		log.Info("FULL SYNC MODE - All documents will be synced regardless of timestamps")
 	}
-
-	if clean {
-		log.Warn("--clean flag is not yet implemented")
-	}
-
 	token, err := loadCredentials()
 	if err != nil || token == "" {
 		log.Error("Failed to load credentials. Exiting.")
@@ -119,7 +146,7 @@ func main() {
 
 	log.Info("Credentials loaded successfully. Fetching documents from Granola API...")
 
-	apiResponse, err := fetchGranolaDocuments(token)
+	apiResponse, err := fetchGranolaDocuments(ctx, client, token)
 	if err != nil {
 		log.Error("Failed to fetch documents", "err", err)
 		os.Exit(1)
@@ -132,14 +159,10 @@ func main() {
 
 	log.Infof("Successfully fetched %d documents from Granola", len(apiResponse.Docs))
 
-	transcriptFilesByID, err := buildTranscriptFileIndex(outputPath, apiResponse.Docs, localNotes)
-	if err != nil {
-		log.Error("Error building transcript file index", "err", err)
-	}
-
+	transcriptFilesByID := buildTranscriptFileIndex(outputPath, apiResponse.Docs, localNotes, transcriptPaths)
 	reconcileTranscriptPaths(outputPath, localNotes, transcriptFilesByID, dryRun)
 
-	if err := syncDocuments(apiResponse.Docs, outputPath, localNotes, token, fullSync, dryRun); err != nil {
+	if err := syncDocuments(ctx, client, apiResponse.Docs, outputPath, localNotes, token, fullSync, dryRun); err != nil {
 		log.Error("Sync error", "err", err)
 		os.Exit(1)
 	}
@@ -225,37 +248,36 @@ func extractAccessToken(creds map[string]any) string {
 	return ""
 }
 
-func fetchGranolaDocuments(token string) (*DocumentsResponse, error) {
+func setAPIHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", "Granola/5.354.0")
+	req.Header.Set("X-Client-Version", "5.354.0")
+}
+
+func fetchGranolaDocuments(ctx context.Context, client *http.Client, token string) (*DocumentsResponse, error) {
 	url := "https://api.granola.ai/v2/get-documents"
 	pageSize := 100
 	maxPages := 1000
 	offset := 0
 	pageIndex := 0
 	var allDocs []GranolaDocument
-	var allDeleted []any
 	seenDocIDs := make(map[string]bool)
-	seenDeletedIDs := make(map[string]bool)
-
-	client := &http.Client{Timeout: 60 * time.Second}
 
 	for pageIndex < maxPages {
 		reqBody := map[string]any{
-			"limit":                      pageSize,
-			"offset":                     offset,
-			"include_last_viewed_panel":  true,
+			"limit":                     pageSize,
+			"offset":                    offset,
+			"include_last_viewed_panel": true,
 		}
 		bodyBytes, _ := json.Marshal(reqBody)
 
-		req, err := http.NewRequestWithContext(context.Background(), "POST", url, strings.NewReader(string(bodyBytes)))
+		req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(bodyBytes)))
 		if err != nil {
 			return nil, fmt.Errorf("could not create request: %v", err)
 		}
-
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("User-Agent", "Granola/5.354.0")
-		req.Header.Set("X-Client-Version", "5.354.0")
+		setAPIHeaders(req, token)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -277,29 +299,12 @@ func fetchGranolaDocuments(token string) (*DocumentsResponse, error) {
 		if response.Docs == nil {
 			response.Docs = []GranolaDocument{}
 		}
-		if response.Deleted == nil {
-			response.Deleted = []any{}
-		}
-
 		newDocsInPage := 0
 		for _, doc := range response.Docs {
 			if doc.ID == "" || !seenDocIDs[doc.ID] {
 				seenDocIDs[doc.ID] = true
 				allDocs = append(allDocs, doc)
 				newDocsInPage++
-			}
-		}
-
-		for _, deleted := range response.Deleted {
-			if idStr, ok := deleted.(string); ok && !seenDeletedIDs[idStr] {
-				seenDeletedIDs[idStr] = true
-				allDeleted = append(allDeleted, deleted)
-			} else if idInt, ok := deleted.(float64); ok {
-				idStr := fmt.Sprintf("%v", idInt)
-				if !seenDeletedIDs[idStr] {
-					seenDeletedIDs[idStr] = true
-					allDeleted = append(allDeleted, deleted)
-				}
 			}
 		}
 
@@ -324,25 +329,18 @@ func fetchGranolaDocuments(token string) (*DocumentsResponse, error) {
 		log.Warnf("Reached pagination safety limit (%d pages)", maxPages)
 	}
 
-	return &DocumentsResponse{Docs: allDocs, Deleted: allDeleted}, nil
+	return &DocumentsResponse{Docs: allDocs}, nil
 }
 
-func fetchDocumentTranscript(token, docID string) (string, []TranscriptSegment, error) {
-	url := fmt.Sprintf("https://api.granola.ai/v1/get-document-transcript")
+func fetchDocumentTranscript(ctx context.Context, client *http.Client, token, docID string) (string, []TranscriptSegment, error) {
 	data, _ := json.Marshal(map[string]string{"document_id": docID})
 
-	req, err := http.NewRequestWithContext(context.Background(), "POST", url, strings.NewReader(string(data)))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.granola.ai/v1/get-document-transcript", strings.NewReader(string(data)))
 	if err != nil {
 		return "", nil, fmt.Errorf("could not create request: %v", err)
 	}
+	setAPIHeaders(req, token)
 
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "Granola/5.354.0")
-	req.Header.Set("X-Client-Version", "5.354.0")
-
-	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, fmt.Errorf("HTTP request failed: %v", err)
@@ -400,8 +398,8 @@ func formatTime(timestamp any) string {
 
 	switch v := timestamp.(type) {
 	case float64:
-		minutes := int(v / 60)
-		seconds := int(v - float64(int(v/60)*60))
+		minutes := int(v) / 60
+		seconds := int(v) % 60
 		return fmt.Sprintf("%02d:%02d", minutes, seconds)
 	case string:
 		return v
@@ -410,39 +408,35 @@ func formatTime(timestamp any) string {
 	}
 }
 
-func convertProseMirrorToMarkdown(content ProseMirrorContent) string {
-	return processNode(content)
-}
-
-func processNode(node ProseMirrorContent) string {
+func convertProseMirrorToMarkdown(node ProseMirrorContent) string {
 	switch node.Type {
 	case "heading":
 		level := 1
 		if attrs, ok := node.Attrs["level"].(float64); ok {
 			level = int(attrs)
 		}
-		var headingText string
+		var b strings.Builder
 		for _, child := range node.Content {
-			headingText += processNode(child)
+			b.WriteString(convertProseMirrorToMarkdown(child))
 		}
-		return fmt.Sprintf("%s %s\n\n", strings.Repeat("#", level), headingText)
+		return fmt.Sprintf("%s %s\n\n", strings.Repeat("#", level), b.String())
 
 	case "paragraph":
-		var paraText string
+		var b strings.Builder
 		for _, child := range node.Content {
-			paraText += processNode(child)
+			b.WriteString(convertProseMirrorToMarkdown(child))
 		}
-		return paraText + "\n\n"
+		return b.String() + "\n\n"
 
 	case "bulletList":
 		var items []string
 		for _, item := range node.Content {
 			if item.Type == "listItem" {
-				var itemContent string
+				var b strings.Builder
 				for _, child := range item.Content {
-					itemContent += processNode(child)
+					b.WriteString(convertProseMirrorToMarkdown(child))
 				}
-				items = append(items, "- "+strings.TrimSpace(itemContent))
+				items = append(items, "- "+strings.TrimSpace(b.String()))
 			}
 		}
 		return strings.Join(items, "\n") + "\n\n"
@@ -451,11 +445,11 @@ func processNode(node ProseMirrorContent) string {
 		return node.Text
 
 	default:
-		var result string
+		var b strings.Builder
 		for _, child := range node.Content {
-			result += processNode(child)
+			b.WriteString(convertProseMirrorToMarkdown(child))
 		}
-		return result
+		return b.String()
 	}
 }
 
@@ -477,8 +471,7 @@ func normalizeTitle(title any) string {
 
 func sanitizeFilename(title any) string {
 	safeTitle := normalizeTitle(title)
-	re := regexp.MustCompile(`[<>:"/\\|?*]`)
-	result := re.ReplaceAllString(safeTitle, "")
+	result := invalidFilenameChars.ReplaceAllString(safeTitle, "")
 	if result == "" {
 		return "Untitled Granola Note"
 	}
@@ -515,21 +508,23 @@ func buildOutputRelativePath(datePrefix, filename string) string {
 	return filepath.Join(parts[0], parts[1], parts[2], filename)
 }
 
-func parseFrontmatterFile(filepath string) (map[string]string, error) {
-	data, err := os.ReadFile(filepath)
+func parseFrontmatter(fpath string) (map[string]string, error) {
+	f, err := os.Open(fpath)
 	if err != nil {
-		log.Warnf("Could not read markdown file '%s': %v", filepath, err)
+		log.Warnf("Could not read markdown file '%s': %v", fpath, err)
 		return nil, err
 	}
+	defer f.Close()
 
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
+	scanner := bufio.NewScanner(f)
+
+	if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "---" {
 		return nil, fmt.Errorf("no frontmatter found")
 	}
 
 	frontmatter := make(map[string]string)
-	for i := 1; i < len(lines); i++ {
-		line := lines[i]
+	for scanner.Scan() {
+		line := scanner.Text()
 		stripped := strings.TrimSpace(line)
 		if stripped == "---" {
 			break
@@ -557,56 +552,67 @@ func parseFrontmatterFile(filepath string) (map[string]string, error) {
 	return frontmatter, nil
 }
 
-func buildLocalNoteIndex(outputPath string) (map[string]map[string]string, error) {
-	notesByID := make(map[string]map[string]string)
+// walkOutputDir scans the output directory once, collecting both the local
+// note index (by granola_id) and all transcript sidecar paths.
+func walkOutputDir(outputPath string) (map[string]LocalNote, []string, error) {
+	notesByID := make(map[string]LocalNote)
 	duplicateIDs := make(map[string]bool)
+	var transcriptPaths []string
 
 	err := filepath.Walk(outputPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && strings.HasSuffix(path, ".md") {
-			frontmatter, err := parseFrontmatterFile(path)
-			if err != nil {
-				return nil
-			}
-
-			granolaID := strings.TrimSpace(frontmatter["granola_id"])
-			if granolaID == "" {
-				return nil
-			}
-
-			granolaUpdatedAt := frontmatter["updated_at"]
-			if granolaUpdatedAt == "" {
-				granolaUpdatedAt = frontmatter["created_at"]
-			}
-
-			noteEntry := map[string]string{
-				"local_filename":     strings.TrimPrefix(path, outputPath+"/"),
-				"granola_updated_at": granolaUpdatedAt,
-				"path":               path,
-			}
-
-			if existing, ok := notesByID[granolaID]; ok {
-				duplicateIDs[granolaID] = true
-				stat1, err1 := os.Stat(path)
-				stat2, err2 := os.Stat(existing["path"])
-				if err1 == nil && err2 == nil {
-					if stat1.ModTime().After(stat2.ModTime()) {
-						notesByID[granolaID] = noteEntry
-					}
-				}
-				log.Warnf("Duplicate granola_id '%s' found in local notes. Using most recently modified file.", granolaID)
-				return nil
-			}
-
-			notesByID[granolaID] = noteEntry
+		if info.IsDir() {
+			return nil
 		}
+
+		if strings.HasSuffix(path, ".transcript.json") {
+			transcriptPaths = append(transcriptPaths, path)
+			return nil
+		}
+
+		if !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+
+		frontmatter, err := parseFrontmatter(path)
+		if err != nil {
+			return nil
+		}
+
+		granolaID := strings.TrimSpace(frontmatter["granola_id"])
+		if granolaID == "" {
+			return nil
+		}
+
+		granolaUpdatedAt := frontmatter["updated_at"]
+		if granolaUpdatedAt == "" {
+			granolaUpdatedAt = frontmatter["created_at"]
+		}
+
+		noteEntry := LocalNote{
+			LocalFilename:    strings.TrimPrefix(path, outputPath+"/"),
+			GranolaUpdatedAt: granolaUpdatedAt,
+			Path:             path,
+		}
+
+		if existing, ok := notesByID[granolaID]; ok {
+			duplicateIDs[granolaID] = true
+			existingStat, err := os.Stat(existing.Path)
+			if err == nil && info.ModTime().After(existingStat.ModTime()) {
+				notesByID[granolaID] = noteEntry
+			}
+			log.Warnf("Duplicate granola_id '%s' found in local notes. Using most recently modified file.", granolaID)
+			return nil
+		}
+
+		notesByID[granolaID] = noteEntry
 		return nil
 	})
 
 	if err != nil {
-		log.Error("Error walking output path:", err)
+		log.Error("Error walking output path", "err", err)
 	}
 
 	if len(duplicateIDs) > 0 {
@@ -614,28 +620,12 @@ func buildLocalNoteIndex(outputPath string) (map[string]map[string]string, error
 	}
 
 	log.Infof("Indexed %d existing notes by granola_id", len(notesByID))
-
-	return notesByID, nil
+	return notesByID, transcriptPaths, nil
 }
 
-func buildTranscriptFileIndex(outputPath string, documents []GranolaDocument, localNotes map[string]map[string]string) (map[string]string, error) {
+func buildTranscriptFileIndex(outputPath string, documents []GranolaDocument, localNotes map[string]LocalNote, allTranscriptPaths []string) map[string]string {
 	transcriptFilesByID := make(map[string]string)
 	matchedTranscriptPaths := make(map[string]bool)
-
-	var allTranscriptPaths []string
-	err := filepath.Walk(outputPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() && strings.HasSuffix(path, ".transcript.json") {
-			allTranscriptPaths = append(allTranscriptPaths, path)
-		}
-		return nil
-	})
-
-	if err != nil {
-		log.Error("Error walking output path for transcripts:", err)
-	}
 
 	for _, doc := range documents {
 		docID := doc.ID
@@ -645,7 +635,7 @@ func buildTranscriptFileIndex(outputPath string, documents []GranolaDocument, lo
 
 		candidatePaths := []string{}
 		if note, ok := localNotes[docID]; ok {
-			localNotePath := filepath.Join(outputPath, note["local_filename"])
+			localNotePath := filepath.Join(outputPath, note.LocalFilename)
 			candidatePaths = append(candidatePaths, strings.TrimSuffix(localNotePath, ".md")+".transcript.json")
 		}
 
@@ -678,10 +668,10 @@ func buildTranscriptFileIndex(outputPath string, documents []GranolaDocument, lo
 		matchedTranscriptPaths[selectedPath] = true
 	}
 
-	unmatchedCount := len(allTranscriptPaths)
+	unmatchedCount := 0
 	for _, p := range allTranscriptPaths {
-		if matchedTranscriptPaths[p] {
-			unmatchedCount--
+		if !matchedTranscriptPaths[p] {
+			unmatchedCount++
 		}
 	}
 
@@ -690,10 +680,10 @@ func buildTranscriptFileIndex(outputPath string, documents []GranolaDocument, lo
 	}
 
 	log.Infof("Indexed %d transcript sidecar files by document ID", len(transcriptFilesByID))
-	return transcriptFilesByID, nil
+	return transcriptFilesByID
 }
 
-func reconcileTranscriptPaths(outputPath string, localNotes map[string]map[string]string, transcriptFilesByID map[string]string, dryRun bool) int {
+func reconcileTranscriptPaths(outputPath string, localNotes map[string]LocalNote, transcriptFilesByID map[string]string, dryRun bool) int {
 	renamedCount := 0
 
 	for docID, noteEntry := range localNotes {
@@ -702,7 +692,7 @@ func reconcileTranscriptPaths(outputPath string, localNotes map[string]map[strin
 			continue
 		}
 
-		expectedNotePath := filepath.Join(outputPath, noteEntry["local_filename"])
+		expectedNotePath := filepath.Join(outputPath, noteEntry.LocalFilename)
 		expectedTranscriptPath := strings.TrimSuffix(expectedNotePath, ".md") + ".transcript.json"
 
 		if actualTranscriptPath == expectedTranscriptPath {
@@ -753,7 +743,7 @@ func fileExists(path string) bool {
 	return !os.IsNotExist(err)
 }
 
-func needsSync(doc GranolaDocument, localNotes map[string]map[string]string, forceFullSync bool) (bool, string) {
+func needsSync(doc GranolaDocument, localNotes map[string]LocalNote, forceFullSync bool) (bool, string) {
 	if forceFullSync {
 		return true, "full-sync requested"
 	}
@@ -772,7 +762,7 @@ func needsSync(doc GranolaDocument, localNotes map[string]map[string]string, for
 	if granolaUpdatedAt == "" {
 		granolaUpdatedAt = doc.CreatedAt
 	}
-	localUpdatedAt := docState["granola_updated_at"]
+	localUpdatedAt := docState.GranolaUpdatedAt
 
 	if granolaUpdatedAt == "" {
 		return true, "no timestamp from Granola"
@@ -789,7 +779,7 @@ func needsSync(doc GranolaDocument, localNotes map[string]map[string]string, for
 	return false, "document unchanged"
 }
 
-func syncDocuments(documents []GranolaDocument, outputPath string, localNotes map[string]map[string]string, token string, fullSync, dryRun bool) error {
+func syncDocuments(ctx context.Context, client *http.Client, documents []GranolaDocument, outputPath string, localNotes map[string]LocalNote, token string, fullSync, dryRun bool) error {
 	syncedCount := 0
 	updatedCount := 0
 	skippedCount := 0
@@ -823,7 +813,7 @@ func syncDocuments(documents []GranolaDocument, outputPath string, localNotes ma
 		var filePath string
 
 		if existingNote, ok := localNotes[docID]; ok {
-			localRelativeFilename = existingNote["local_filename"]
+			localRelativeFilename = existingNote.LocalFilename
 			filePath = filepath.Join(outputPath, localRelativeFilename)
 		} else {
 			localRelativePath := buildGeneratedNoteRelativePath(doc)
@@ -832,13 +822,13 @@ func syncDocuments(documents []GranolaDocument, outputPath string, localNotes ma
 		}
 
 		transcriptJSONPath := strings.TrimSuffix(filePath, ".md") + ".transcript.json"
-		isUpdate := localNotes[docID] != nil
+		_, isUpdate := localNotes[docID]
 
 		if dryRun {
 			if contentToParse == nil {
 				var transcriptMarkdown string
 				if docID != "" {
-					transcriptMarkdown, _, _ = fetchDocumentTranscript(token, docID)
+					transcriptMarkdown, _, _ = fetchDocumentTranscript(ctx, client, token, docID)
 				}
 				if transcriptMarkdown == "" {
 					log.Warnf("[DRY RUN] Would SKIP document '%s' (ID: %s) - no suitable content found in 'last_viewed_panel' and no transcript available", title, displayDocID)
@@ -878,7 +868,7 @@ func syncDocuments(documents []GranolaDocument, outputPath string, localNotes ma
 		var transcriptData []TranscriptSegment
 		if docID != "" {
 			var err error
-			transcriptMarkdown, transcriptData, err = fetchDocumentTranscript(token, docID)
+			transcriptMarkdown, transcriptData, err = fetchDocumentTranscript(ctx, client, token, docID)
 			if err != nil {
 				log.Errorf("Error fetching transcript for %s: %v", docID, err)
 			}
@@ -936,10 +926,10 @@ func syncDocuments(documents []GranolaDocument, outputPath string, localNotes ma
 			if granolaUpdatedAt == "" {
 				granolaUpdatedAt = doc.CreatedAt
 			}
-			localNotes[docID] = map[string]string{
-				"local_filename":     localRelativeFilename,
-				"granola_updated_at": granolaUpdatedAt,
-				"path":               filePath,
+			localNotes[docID] = LocalNote{
+				LocalFilename:    localRelativeFilename,
+				GranolaUpdatedAt: granolaUpdatedAt,
+				Path:             filePath,
 			}
 		}
 
@@ -999,25 +989,25 @@ func parseProseMirrorContent(data map[string]any) *ProseMirrorContent {
 }
 
 func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
-	frontmatter := "---\n"
-	frontmatter += fmt.Sprintf("granola_id: %s\n", doc.ID)
+	var b strings.Builder
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "granola_id: %s\n", doc.ID)
 	escapedTitle := strings.ReplaceAll(normalizeTitle(doc.Title), `"`, `\"`)
-	frontmatter += fmt.Sprintf("title: \"%s\"\n", escapedTitle)
+	fmt.Fprintf(&b, "title: \"%s\"\n", escapedTitle)
 
 	if doc.CreatedAt != "" {
-		frontmatter += fmt.Sprintf("created_at: %s\n", doc.CreatedAt)
+		fmt.Fprintf(&b, "created_at: %s\n", doc.CreatedAt)
 	}
 	if doc.UpdatedAt != "" {
-		frontmatter += fmt.Sprintf("updated_at: %s\n", doc.UpdatedAt)
+		fmt.Fprintf(&b, "updated_at: %s\n", doc.UpdatedAt)
 	}
 
 	if hasTranscript {
-		frontmatter += "has_transcript: true\n"
+		b.WriteString("has_transcript: true\n")
 	} else {
-		frontmatter += "has_transcript: false\n"
+		b.WriteString("has_transcript: false\n")
 	}
 
-	frontmatter += "---\n\n"
-
-	return frontmatter
+	b.WriteString("---\n\n")
+	return b.String()
 }

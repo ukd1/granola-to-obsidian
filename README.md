@@ -53,7 +53,6 @@ go build -o granola-sync .
 **Options:**
 - `--dry-run`: Preview what would be synced without making changes
 - `--full-sync`: Force sync all documents (ignore timestamps)
-- `--clean`: Remove local files for documents deleted from Granola *(not implemented yet)*
 
 **Environment Variables:**
 - `LOG_LEVEL`: Logging verbosity (`debug`, `info`, `warn`, `error`, `fatal`). Defaults to `info`.
