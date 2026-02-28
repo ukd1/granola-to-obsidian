@@ -1,23 +1,20 @@
 # Granola to Obsidian Sync
 
-A Python script that syncs notes and transcripts from Granola to your Obsidian vault. Supports incremental sync, only processing new or updated documents on subsequent runs.
-
-Original script based on this article: https://josephthacker.com/hacking/2025/05/08/reverse-engineering-granola-notes.html
-
+A Go tool that syncs notes and transcripts from Granola to your Obsidian vault. Supports incremental sync, only processing new or updated documents on subsequent runs.
 
 ## Features
 
-- 🔄 **Incremental Sync**: Only syncs new or updated documents
-- 📚 **Full History Pagination**: Fetches all available documents, not just the first page
-- 📝 **Full Transcript Support**: Includes meeting transcripts in formatted sections
-- 📅 **Date Prefixed Filenames**: Files named as "YYYY-MM-DD - [title].md"
-- 🧭 **Frontmatter-Based Tracking**: Uses each note's `granola_id` frontmatter, no extra state file
-- 🔍 **Dry Run Mode**: Preview changes before syncing
-- 📊 **Detailed Logging**: Clear reporting of what was synced, updated, or skipped
+- **Incremental Sync**: Only syncs new or updated documents
+- **Full History Pagination**: Fetches all available documents, not just the first page
+- **Full Transcript Support**: Includes meeting transcripts in formatted sections
+- **Date Prefixed Filenames**: Files named as "YYYY-MM-DD - [title].md"
+- **Frontmatter-Based Tracking**: Uses each note's `granola_id` frontmatter, no extra state file
+- **Dry Run Mode**: Preview changes before syncing
+- **Detailed Logging**: Clear reporting of what was synced, updated, or skipped
 
 ## Prerequisites
 
-- Python 3.13+
+- Go 1.25+
 - Active Granola account with documents
 - Granola desktop app installed (for credentials)
 
@@ -27,15 +24,13 @@ Original script based on this article: https://josephthacker.com/hacking/2025/05
 
 ```bash
 git clone <repository-url>
-cd granola2obsidian
+cd granola-to-obsidian
 ```
 
-### 2. Install Dependencies
-
-Install dependencies using `uv`:
+### 2. Build
 
 ```bash
-uv sync
+go build -o granola-sync .
 ```
 
 ## Usage
@@ -43,15 +38,13 @@ uv sync
 ### Basic Sync
 
 ```bash
-
-# Sync to your Obsidian folder
-uv run main.py /path/to/your/obsidian/folder
+./granola-sync /path/to/your/obsidian/folder
 ```
 
 ### Command Line Options
 
 ```bash
-uv run main.py [OPTIONS] OUTPUT_DIR
+./granola-sync [OPTIONS] OUTPUT_DIR
 ```
 
 **Positional Arguments:**
@@ -63,24 +56,27 @@ uv run main.py [OPTIONS] OUTPUT_DIR
 - `--clean`: Remove local files for documents deleted from Granola *(not implemented yet)*
 
 **Environment Variables:**
-- `LOG_LEVEL`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). Defaults to `DEBUG`.
+- `LOG_LEVEL`: Logging verbosity (`debug`, `info`, `warn`, `error`, `fatal`). Defaults to `info`.
 
 ### Examples
 
 ```bash
 # Daily incremental sync (recommended)
-uv run main.py ~/Documents/MyVault/Granola_Notes
+./granola-sync ~/Documents/MyVault/Granola_Notes
 
 # Preview changes before syncing
-uv run main.py --dry-run ~/Documents/MyVault/Granola_Notes
+./granola-sync --dry-run ~/Documents/MyVault/Granola_Notes
 
 # Force sync all documents
-uv run main.py --full-sync ~/Documents/MyVault/Granola_Notes
+./granola-sync --full-sync ~/Documents/MyVault/Granola_Notes
+
+# Verbose logging
+LOG_LEVEL=debug ./granola-sync ~/Documents/MyVault/Granola_Notes
 ```
 
 ## Frontmatter Indexing
 
-The script scans existing markdown files in your output folder and builds an in-memory index from frontmatter:
+The tool scans existing markdown files in your output folder and builds an in-memory index from frontmatter:
 
 - `granola_id` (required for matching)
 - `updated_at` (or `created_at` fallback for incremental comparison)
@@ -136,7 +132,7 @@ has_transcript: true
 
 ## Credentials
 
-The script automatically loads credentials from Granola's configuration:
+The tool automatically loads credentials from Granola's configuration:
 - **Location**: `~/Library/Application Support/Granola/supabase.json`
 - **Required**: Active Granola desktop app installation
 - **No manual configuration needed**
@@ -144,7 +140,7 @@ The script automatically loads credentials from Granola's configuration:
 
 ## Logging
 
-The script creates detailed logs in `granola_sync.log` including:
+The tool logs to both stderr and `granola_sync.log` including:
 - Sync statistics (created, updated, skipped counts)
 - Document processing details
 - API response information
@@ -162,23 +158,25 @@ The script creates detailed logs in `granola_sync.log` including:
    - Not all documents have transcripts (this is normal)
    - Only meeting recordings generate transcripts
 
-3. **"Unexpected transcript format"**
-   - Inspect `granola_sync.log` for the raw response shape logged by the script
-   - Check logs for detailed error information
-
-4. **"No access token found in credentials file"**
+3. **"No access token found in credentials file"**
    - Verify `~/Library/Application Support/Granola/supabase.json` exists
    - Confirm it contains either `workos_tokens` or `cognito_tokens`
    - Sign out/in of Granola desktop app to refresh credentials if needed
 
-5. **"Skipping document ... no suitable content found in 'last_viewed_panel' and no transcript available"**
+4. **"Skipping document ... no suitable content found"**
    - Some docs may not have note-body content in the documents response
-   - The script now falls back to transcript-only export when transcript data exists
+   - The tool falls back to transcript-only export when transcript data exists
    - This warning means neither note-body content nor transcript data was available
 
 ### Debug Mode
 
-For detailed debugging, check the log file:
+For detailed debugging:
+
+```bash
+LOG_LEVEL=debug ./granola-sync ~/path/to/vault/Granola_Notes
+```
+
+Or check the log file:
 
 ```bash
 tail -f granola_sync.log
@@ -189,29 +187,23 @@ tail -f granola_sync.log
 To force a complete re-sync of all documents:
 
 ```bash
-uv run main.py --full-sync /path/to/your/obsidian/folder
+./granola-sync --full-sync /path/to/your/obsidian/folder
 ```
-
-## Daily Usage Workflow
-
-1. **Set up once**: Install and test the script
-2. **Daily run**: Execute `uv run main.py ~/path/to/vault/Granola_Notes`
-3. **Check results**: Review the sync statistics in the output
-4. **Open Obsidian**: Your new/updated notes are ready!
-
-The incremental sync makes daily usage fast - typically only processing a few new documents rather than your entire Granola library.
 
 ## File Structure
 
 ```
-granola2obsidian/
-├── main.py                      # Main sync script
-├── pyproject.toml             # Project dependencies and metadata
-├── uv.lock                    # Locked dependency versions
-├── granola_sync.log          # Detailed logs
-└── README.md                 # This file
+granola-to-obsidian/
+├── main.go              # Main sync tool
+├── go.mod               # Go module definition
+├── go.sum               # Dependency checksums
+├── granola_sync.log     # Detailed logs (gitignored)
+└── README.md            # This file
 ```
 
-## Contributing
+## History
 
-Feel free to submit issues, feature requests, or pull requests to improve the script!
+Original version:
+* forked from https://github.com/jeremysuriel/granola-to-obsidian
+* script based on this article: https://josephthacker.com/hacking/2025/05/08/reverse-engineering-granola-notes.html.
+* rewritten in Go with a focus on incremental syncing and robust error handling (last python version: https://github.com/ukd1/granola-to-obsidian/commit/866bd292bae094bbca111121500852ec0b0b2a07)
