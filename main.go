@@ -1007,6 +1007,7 @@ func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
 	} else {
 		b.WriteString("has_transcript: false\n")
 	}
+	b.WriteString("with: []\n")
 
 	b.WriteString("---\n\n")
 	return b.String()
