@@ -132,10 +132,11 @@ has_transcript: true
 ## Credentials
 
 The tool automatically loads credentials from Granola's configuration:
-- **Location**: `~/Library/Application Support/Granola/supabase.json`
-- **Required**: Active Granola desktop app installation
-- **No manual configuration needed**
-- **Supported token formats**: `workos_tokens` (current) and `cognito_tokens` (legacy)
+- **Encrypted (preferred)**: `~/Library/Application Support/Granola/supabase.json.enc`, decrypted using the `Granola Safe Storage` macOS Keychain entry. The first run will prompt for keychain access; click "Always Allow" to silence subsequent prompts.
+- **Plaintext (legacy fallback)**: `~/Library/Application Support/Granola/supabase.json`, used only if the encrypted file is missing or unreadable.
+- **Required**: Active Granola desktop app installation, signed in.
+- **No manual configuration needed.**
+- **Supported token formats**: `workos_tokens` (current) and `cognito_tokens` (legacy).
 
 ## Logging
 
@@ -157,10 +158,10 @@ The tool logs to both stderr and `granola_sync.log` including:
    - Not all documents have transcripts (this is normal)
    - Only meeting recordings generate transcripts
 
-3. **"No access token found in credentials file"**
-   - Verify `~/Library/Application Support/Granola/supabase.json` exists
-   - Confirm it contains either `workos_tokens` or `cognito_tokens`
-   - Sign out/in of Granola desktop app to refresh credentials if needed
+3. **"No access token found" / "access token has expired"**
+   - Open the Granola desktop app — it will refresh credentials automatically and re-write `supabase.json.enc`.
+   - If the keychain prompt was denied, re-run and click "Always Allow" so the tool can read the `Granola Safe Storage` entry.
+   - Last resort: sign out and back in to Granola desktop.
 
 4. **"Skipping document ... no suitable content found"**
    - Some docs may not have note-body content in the documents response
