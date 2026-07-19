@@ -2,11 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/pbkdf2"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -138,9 +145,9 @@ func main() {
 	if fullSync {
 		log.Info("FULL SYNC MODE - All documents will be synced regardless of timestamps")
 	}
-	token, err := loadCredentials()
+	token, err := loadAccessToken()
 	if err != nil || token == "" {
-		log.Error("Failed to load credentials. Exiting.")
+		log.Error("Failed to load access token. Exiting.", "err", err)
 		os.Exit(1)
 	}
 
@@ -182,70 +189,233 @@ func validateOutputDir(path string) error {
 	return nil
 }
 
-func loadCredentials() (string, error) {
+// tokenExpiryFromJWT extracts the unix-seconds expiry from a JWT's exp
+// claim. Returns 0 if the token can't be parsed.
+func tokenExpiryFromJWT(token string) int64 {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0
+	}
+	if exp, ok := payload["exp"].(float64); ok {
+		return int64(exp)
+	}
+	return 0
+}
+
+// granolaUserDataDir returns the directory Granola.app uses for app data.
+func granolaUserDataDir() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("could not get home directory: %v", err)
 	}
-
-	credsPath := filepath.Join(homeDir, "Library", "Application Support", "Granola", "supabase.json")
-	data, err := os.ReadFile(credsPath)
-	if err != nil {
-		log.Errorf("Credentials file not found at: %s", credsPath)
-		return "", fmt.Errorf("credentials file not found")
-	}
-
-	var creds map[string]any
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return "", fmt.Errorf("could not parse credentials: %v", err)
-	}
-
-	token := extractAccessToken(creds)
-	if token == "" {
-		return "", fmt.Errorf("no access token found in credentials")
-	}
-
-	log.Debug("Successfully loaded credentials")
-	return token, nil
+	return filepath.Join(homeDir, "Library", "Application Support", "Granola"), nil
 }
 
+// granolaSafeStoragePassword returns the keychain entry that Electron's
+// safeStorage API uses to wrap Granola's data-encryption key.
+func granolaSafeStoragePassword() ([]byte, error) {
+	out, err := exec.Command("security", "find-generic-password", "-s", "Granola Safe Storage", "-w").Output()
+	if err != nil {
+		return nil, fmt.Errorf("could not read 'Granola Safe Storage' from keychain (was access denied?): %v", err)
+	}
+	return bytes.TrimSpace(out), nil
+}
+
+// chromiumSafeStorageDecrypt mirrors Chromium's OSCrypt format used by
+// Electron safeStorage on macOS: optional "v10"/"v11" prefix, AES-128-CBC
+// with a 16-space IV, key derived via PBKDF2-HMAC-SHA1(saltysalt, 1003 iters).
+func chromiumSafeStorageDecrypt(blob, password []byte) ([]byte, error) {
+	if len(blob) >= 3 && (bytes.Equal(blob[:3], []byte("v10")) || bytes.Equal(blob[:3], []byte("v11"))) {
+		blob = blob[3:]
+	}
+	key, err := pbkdf2.Key(sha1.New, string(password), []byte("saltysalt"), 1003, 16)
+	if err != nil {
+		return nil, fmt.Errorf("PBKDF2 derivation failed: %v", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) == 0 || len(blob)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext length %d not a multiple of AES block size", len(blob))
+	}
+	iv := bytes.Repeat([]byte{' '}, aes.BlockSize)
+	out := make([]byte, len(blob))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, blob)
+	pad := int(out[len(out)-1])
+	if pad == 0 || pad > aes.BlockSize {
+		return nil, fmt.Errorf("invalid PKCS7 padding")
+	}
+	return out[:len(out)-pad], nil
+}
+
+// loadGranolaDEK returns the 32-byte AES-256 data-encryption key Granola uses
+// for its *.enc files. The DEK is stored at <userData>/storage.dek, wrapped
+// by Electron safeStorage and base64-encoded.
+func loadGranolaDEK(userDataDir string) ([]byte, error) {
+	dekBlob, err := os.ReadFile(filepath.Join(userDataDir, "storage.dek"))
+	if err != nil {
+		return nil, fmt.Errorf("could not read storage.dek: %v", err)
+	}
+	password, err := granolaSafeStoragePassword()
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := chromiumSafeStorageDecrypt(dekBlob, password)
+	if err != nil {
+		return nil, fmt.Errorf("could not decrypt storage.dek: %v", err)
+	}
+	dek, err := base64.StdEncoding.DecodeString(string(decoded))
+	if err != nil {
+		return nil, fmt.Errorf("could not base64-decode DEK: %v", err)
+	}
+	if len(dek) != 32 {
+		return nil, fmt.Errorf("unexpected DEK length %d (expected 32)", len(dek))
+	}
+	return dek, nil
+}
+
+// decryptGranolaEncFile decrypts files Granola writes via its DEK-wrapped
+// AES-256-GCM scheme: [12-byte IV][ciphertext][16-byte tag].
+func decryptGranolaEncFile(path string, dek []byte) ([]byte, error) {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) < 12+16 {
+		return nil, fmt.Errorf("encrypted file too short: %d bytes", len(blob))
+	}
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return gcm.Open(nil, blob[:12], blob[12:], nil)
+}
+
+// extractAccessToken returns the live access_token from a parsed credentials
+// map, preferring workos_tokens over cognito_tokens. Returns "" if no usable
+// token is found.
 func extractAccessToken(creds map[string]any) string {
 	for _, key := range []string{"workos_tokens", "cognito_tokens"} {
-		tokenPayload := creds[key]
-		if tokenPayload == nil {
+		tokenData := extractTokenMap(creds, key)
+		if tokenData == nil {
 			continue
 		}
-
-		var tokenData map[string]any
-
-		switch v := tokenPayload.(type) {
-		case string:
-			if v == "" {
-				continue
-			}
-			if err := json.Unmarshal([]byte(v), &tokenData); err != nil {
-				log.Warnf("Could not parse token payload from '%s'", key)
-				continue
-			}
-		case map[string]any:
-			tokenData = v
-		default:
-			continue
-		}
-
-		if accessToken, ok := tokenData["access_token"].(string); ok && accessToken != "" {
-			log.Debugf("Loaded access token from '%s'", key)
-			return accessToken
+		if access, _ := tokenData["access_token"].(string); access != "" {
+			return access
 		}
 	}
-
-	// Fallback: top-level access_token
-	if accessToken, ok := creds["access_token"].(string); ok && accessToken != "" {
-		log.Debug("Loaded access token from top-level field")
-		return accessToken
-	}
-
 	return ""
+}
+
+// loadAccessToken reads Granola's stored credentials and returns a live
+// access token. The encrypted supabase.json.enc is preferred since Granola
+// actively rotates it; the plaintext supabase.json is tried as a fallback
+// whenever the encrypted source is unavailable or doesn't yield a token (it
+// can briefly be missing the expected keys mid-write).
+func loadAccessToken() (string, error) {
+	userDataDir, err := granolaUserDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	encPath := filepath.Join(userDataDir, "supabase.json.enc")
+	plainPath := filepath.Join(userDataDir, "supabase.json")
+
+	tryDecrypted := func() (string, error) {
+		if !fileExists(encPath) {
+			return "", fmt.Errorf("not present")
+		}
+		dek, err := loadGranolaDEK(userDataDir)
+		if err != nil {
+			return "", fmt.Errorf("DEK load failed: %v", err)
+		}
+		plain, err := decryptGranolaEncFile(encPath, dek)
+		if err != nil {
+			return "", fmt.Errorf("decrypt failed: %v", err)
+		}
+		var creds map[string]any
+		if err := json.Unmarshal(plain, &creds); err != nil {
+			return "", fmt.Errorf("parse failed: %v", err)
+		}
+		access := extractAccessToken(creds)
+		if access == "" {
+			return "", fmt.Errorf("no workos_tokens or cognito_tokens in decrypted payload")
+		}
+		return access, nil
+	}
+
+	tryPlain := func() (string, error) {
+		data, err := os.ReadFile(plainPath)
+		if err != nil {
+			return "", fmt.Errorf("read failed: %v", err)
+		}
+		var creds map[string]any
+		if err := json.Unmarshal(data, &creds); err != nil {
+			return "", fmt.Errorf("parse failed: %v", err)
+		}
+		access := extractAccessToken(creds)
+		if access == "" {
+			return "", fmt.Errorf("no workos_tokens or cognito_tokens in payload")
+		}
+		return access, nil
+	}
+
+	access, encErr := tryDecrypted()
+	if access != "" {
+		if exp := tokenExpiryFromJWT(access); exp != 0 && time.Now().Unix() >= exp {
+			log.Warnf("Token from %s has expired; trying plaintext fallback", encPath)
+		} else {
+			log.Debugf("Loaded access token from %s", encPath)
+			return access, nil
+		}
+	} else {
+		log.Debugf("Could not load token from %s: %v", encPath, encErr)
+	}
+
+	access, plainErr := tryPlain()
+	if access == "" {
+		return "", fmt.Errorf("could not load Granola credentials (encrypted: %v; plaintext: %v) — open the Granola desktop app to refresh, then re-run", encErr, plainErr)
+	}
+	if exp := tokenExpiryFromJWT(access); exp != 0 && time.Now().Unix() >= exp {
+		return "", fmt.Errorf("Granola access tokens in both %s and %s have expired; open the Granola desktop app to refresh, then re-run", encPath, plainPath)
+	}
+	log.Debugf("Loaded access token from %s", plainPath)
+	return access, nil
+}
+
+func extractTokenMap(creds map[string]any, key string) map[string]any {
+	payload := creds[key]
+	if payload == nil {
+		return nil
+	}
+	switch v := payload.(type) {
+	case string:
+		if v == "" {
+			return nil
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(v), &parsed); err != nil {
+			log.Warnf("Could not parse token payload from '%s'", key)
+			return nil
+		}
+		return parsed
+	case map[string]any:
+		return v
+	}
+	return nil
 }
 
 func setAPIHeaders(req *http.Request, token string) {
@@ -1009,6 +1179,7 @@ func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
 	} else {
 		b.WriteString("has_transcript: false\n")
 	}
+	b.WriteString("with: []\n")
 
 	b.WriteString("tags:\n  - meeting\n")
 	b.WriteString("---\n\n")
