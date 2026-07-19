@@ -499,13 +499,15 @@ func extractDateFromDoc(doc GranolaDocument) string {
 }
 
 func buildOutputRelativePath(datePrefix, filename string) string {
-	parts := strings.Split(datePrefix, "-")
-	if len(parts) != 3 {
+	t, err := time.Parse("2006-01-02", datePrefix)
+	if err != nil {
 		log.Warnf("Unexpected date prefix '%s', falling back to unsorted root path", datePrefix)
 		return filename
 	}
 
-	return filepath.Join(parts[0], parts[1], parts[2], filename)
+	yearDir := t.Format("2006")
+	monthDir := t.Format("01") + " - " + t.Format("Jan")
+	return filepath.Join("granola", yearDir, monthDir, filename)
 }
 
 func parseFrontmatter(fpath string) (map[string]string, error) {
@@ -1008,6 +1010,7 @@ func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
 		b.WriteString("has_transcript: false\n")
 	}
 
+	b.WriteString("tags:\n  - meeting\n")
 	b.WriteString("---\n\n")
 	return b.String()
 }
