@@ -2,7 +2,10 @@ module granola-sync
 
 go 1.25.0
 
-require github.com/charmbracelet/log v0.4.2
+require (
+	github.com/charmbracelet/log v0.4.2
+	golang.org/x/net v0.56.0
+)
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
@@ -19,5 +22,5 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 )

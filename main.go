@@ -21,11 +21,14 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
+	"golang.org/x/net/html"
 )
 
 var (
 	invalidFilenameChars = regexp.MustCompile(`[<>:"/\\|?*]`)
 	ansiEscape           = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	htmlInlineSpace      = regexp.MustCompile(`\s+`)
+	htmlBlankLines       = regexp.MustCompile(`\n{3,}`)
 )
 
 type TranscriptSegment struct {
@@ -52,6 +55,19 @@ type GranolaDocument struct {
 
 type DocumentsResponse struct {
 	Docs []GranolaDocument `json:"docs"`
+}
+
+// DocumentPanel is one AI-generated panel (e.g. the meeting summary) returned by
+// the get-document-panels endpoint. Content is HTML. This is the source of truth
+// for summaries regardless of whether the panel was ever opened in the desktop
+// app, unlike the last_viewed_panel field embedded in the documents response.
+type DocumentPanel struct {
+	ID               string `json:"id"`
+	TemplateSlug     string `json:"template_slug"`
+	Content          string `json:"content"`
+	ContentUpdatedAt string `json:"content_updated_at"`
+	UpdatedAt        string `json:"updated_at"`
+	DeletedAt        any    `json:"deleted_at"`
 }
 
 type LocalNote struct {
@@ -537,6 +553,273 @@ func fetchDocumentTranscript(ctx context.Context, client *http.Client, token, do
 	return formatted, transcript, nil
 }
 
+// fetchDocumentPanels retrieves a document's panels (summaries) from Granola. The
+// endpoint returns the panels even when the meeting was never opened in the
+// desktop app, which is why it can recover summaries that last_viewed_panel omits.
+func fetchDocumentPanels(ctx context.Context, client *http.Client, token, docID string) ([]DocumentPanel, error) {
+	data, _ := json.Marshal(map[string]string{"document_id": docID})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.granola.ai/v1/get-document-panels", strings.NewReader(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("could not create request: %v", err)
+	}
+	setAPIHeaders(req, token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	var panels []DocumentPanel
+	if err := json.NewDecoder(resp.Body).Decode(&panels); err != nil {
+		return nil, fmt.Errorf("could not decode panels: %v", err)
+	}
+	return panels, nil
+}
+
+// selectSummaryPanel picks the best summary panel from a document's panels. It
+// prefers Granola's meeting-summary templates, and among equally-ranked panels
+// the most recently updated one with non-empty content.
+func selectSummaryPanel(panels []DocumentPanel) *DocumentPanel {
+	var best *DocumentPanel
+	bestScore := -1
+
+	for i := range panels {
+		p := &panels[i]
+		if p.DeletedAt != nil || strings.TrimSpace(p.Content) == "" {
+			continue
+		}
+
+		score := 1
+		if strings.HasPrefix(p.TemplateSlug, "meeting-summary") {
+			score = 2
+		}
+
+		if best == nil || score > bestScore ||
+			(score == bestScore && panelUpdatedAt(p) > panelUpdatedAt(best)) {
+			best = p
+			bestScore = score
+		}
+	}
+
+	return best
+}
+
+func panelUpdatedAt(p *DocumentPanel) string {
+	if p.ContentUpdatedAt != "" {
+		return p.ContentUpdatedAt
+	}
+	return p.UpdatedAt
+}
+
+// panelContentToMarkdown converts a panel's stored content to markdown. Granola
+// serves panel content as HTML; ProseMirror JSON is handled as a fallback in case
+// other panel types embed it.
+func panelContentToMarkdown(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(trimmed, "{") {
+		var node map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &node); err == nil && node["type"] == "doc" {
+			return strings.TrimSpace(convertProseMirrorToMarkdown(*parseProseMirrorContent(node)))
+		}
+	}
+
+	return htmlToMarkdown(trimmed)
+}
+
+// htmlToMarkdown converts a fragment of HTML to markdown, covering the elements
+// Granola uses in summaries: headings, paragraphs, nested lists, bold/italic,
+// inline code, links, and blockquotes.
+func htmlToMarkdown(htmlStr string) string {
+	doc, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		return strings.TrimSpace(htmlStr)
+	}
+
+	var b strings.Builder
+	renderHTMLBlock(doc, &b, 0)
+
+	out := htmlBlankLines.ReplaceAllString(b.String(), "\n\n")
+	return strings.TrimSpace(out)
+}
+
+func renderHTMLBlock(n *html.Node, b *strings.Builder, depth int) {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		switch c.Type {
+		case html.TextNode:
+			if txt := strings.TrimSpace(c.Data); txt != "" {
+				b.WriteString(htmlInlineSpace.ReplaceAllString(txt, " ") + "\n\n")
+			}
+		case html.ElementNode:
+			switch c.Data {
+			case "h1", "h2", "h3", "h4", "h5", "h6":
+				level := int(c.Data[1] - '0')
+				if txt := strings.TrimSpace(renderHTMLInline(c)); txt != "" {
+					b.WriteString(strings.Repeat("#", level) + " " + txt + "\n\n")
+				}
+			case "p":
+				if txt := strings.TrimSpace(renderHTMLInline(c)); txt != "" {
+					b.WriteString(txt + "\n\n")
+				}
+			case "ul", "ol":
+				renderHTMLList(c, b, depth, c.Data == "ol")
+				if depth == 0 {
+					b.WriteString("\n")
+				}
+			case "blockquote":
+				var inner strings.Builder
+				renderHTMLBlock(c, &inner, depth)
+				for _, line := range strings.Split(strings.TrimRight(inner.String(), "\n"), "\n") {
+					b.WriteString("> " + line + "\n")
+				}
+				b.WriteString("\n")
+			case "pre":
+				if txt := strings.TrimRight(renderHTMLInline(c), "\n"); txt != "" {
+					b.WriteString("```\n" + txt + "\n```\n\n")
+				}
+			case "br":
+				// stray break at block level; ignore
+			case "html", "head", "body", "div", "section", "article", "main", "header", "footer":
+				renderHTMLBlock(c, b, depth)
+			default:
+				if txt := strings.TrimSpace(renderHTMLInline(c)); txt != "" {
+					b.WriteString(txt + "\n\n")
+				}
+			}
+		}
+	}
+}
+
+func renderHTMLList(list *html.Node, b *strings.Builder, depth int, ordered bool) {
+	idx := 0
+	indent := strings.Repeat("  ", depth)
+
+	for li := list.FirstChild; li != nil; li = li.NextSibling {
+		if li.Type != html.ElementNode || li.Data != "li" {
+			continue
+		}
+		idx++
+
+		marker := "- "
+		if ordered {
+			marker = fmt.Sprintf("%d. ", idx)
+		}
+
+		if txt := strings.TrimSpace(renderHTMLListItemInline(li)); txt != "" {
+			b.WriteString(indent + marker + txt + "\n")
+		}
+
+		for c := li.FirstChild; c != nil; c = c.NextSibling {
+			if c.Type == html.ElementNode && (c.Data == "ul" || c.Data == "ol") {
+				renderHTMLList(c, b, depth+1, c.Data == "ol")
+			}
+		}
+	}
+}
+
+// renderHTMLListItemInline renders a list item's own content, skipping nested
+// lists (those are emitted separately with deeper indentation).
+func renderHTMLListItemInline(li *html.Node) string {
+	var b strings.Builder
+	for c := li.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && (c.Data == "ul" || c.Data == "ol") {
+			continue
+		}
+		b.WriteString(renderHTMLInlineNode(c))
+	}
+	return b.String()
+}
+
+func renderHTMLInline(n *html.Node) string {
+	var b strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		b.WriteString(renderHTMLInlineNode(c))
+	}
+	return b.String()
+}
+
+func renderHTMLInlineNode(n *html.Node) string {
+	switch n.Type {
+	case html.TextNode:
+		return htmlInlineSpace.ReplaceAllString(n.Data, " ")
+	case html.ElementNode:
+		switch n.Data {
+		case "strong", "b":
+			return "**" + renderHTMLInline(n) + "**"
+		case "em", "i":
+			return "*" + renderHTMLInline(n) + "*"
+		case "code":
+			return "`" + renderHTMLInline(n) + "`"
+		case "a":
+			txt := renderHTMLInline(n)
+			if href := htmlAttr(n, "href"); href != "" {
+				return "[" + txt + "](" + href + ")"
+			}
+			return txt
+		case "br":
+			return "\n"
+		default:
+			return renderHTMLInline(n)
+		}
+	}
+	return ""
+}
+
+func htmlAttr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+// resolveNoteBody returns the note-body markdown for a document plus a short label
+// describing its source. It first uses the ProseMirror content cached in
+// last_viewed_panel (populated only after you open the meeting in the desktop
+// app), then falls back to the get-document-panels endpoint, which holds the AI
+// summary regardless of whether it was ever viewed.
+func resolveNoteBody(ctx context.Context, client *http.Client, token string, doc GranolaDocument) (string, string) {
+	if raw, ok := doc.LastViewedPanel["content"].(map[string]any); ok && raw["type"] == "doc" {
+		if md := strings.TrimSpace(convertProseMirrorToMarkdown(*parseProseMirrorContent(raw))); md != "" {
+			return md, "last_viewed_panel"
+		}
+	}
+
+	if doc.ID == "" {
+		return "", ""
+	}
+
+	panels, err := fetchDocumentPanels(ctx, client, token, doc.ID)
+	if err != nil {
+		log.Warnf("Could not fetch panels for document %s: %v", doc.ID, err)
+		return "", ""
+	}
+
+	panel := selectSummaryPanel(panels)
+	if panel == nil {
+		return "", ""
+	}
+
+	md := panelContentToMarkdown(panel.Content)
+	if md == "" {
+		return "", ""
+	}
+	return md, fmt.Sprintf("get-document-panels (%s)", panel.TemplateSlug)
+}
+
 func formatTranscriptSegments(segments []TranscriptSegment) string {
 	var lines []string
 
@@ -972,12 +1255,7 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 
 		log.Infof("Processing document: %s (ID: %s) - %s", title, displayDocID, reason)
 
-		var contentToParse *ProseMirrorContent
-		if lastViewedPanelRaw, ok := doc.LastViewedPanel["content"].(map[string]any); ok {
-			if lastViewedPanelRaw["type"] == "doc" {
-				contentToParse = parseProseMirrorContent(lastViewedPanelRaw)
-			}
-		}
+		noteBody, bodySource := resolveNoteBody(ctx, client, token, doc)
 
 		var localRelativeFilename string
 		var filePath string
@@ -995,13 +1273,13 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 		_, isUpdate := localNotes[docID]
 
 		if dryRun {
-			if contentToParse == nil {
+			if noteBody == "" {
 				var transcriptMarkdown string
 				if docID != "" {
 					transcriptMarkdown, _, _ = fetchDocumentTranscript(ctx, client, token, docID)
 				}
 				if transcriptMarkdown == "" {
-					log.Warnf("[DRY RUN] Would SKIP document '%s' (ID: %s) - no suitable content found in 'last_viewed_panel' and no transcript available", title, displayDocID)
+					log.Warnf("[DRY RUN] Would SKIP document '%s' (ID: %s) - no note body found and no transcript available", title, displayDocID)
 					skippedCount++
 					continue
 				}
@@ -1012,8 +1290,8 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 				action = "CREATE"
 			}
 
-			if contentToParse != nil {
-				log.Infof("[DRY RUN] Would %s: %s", action, localRelativeFilename)
+			if noteBody != "" {
+				log.Infof("[DRY RUN] Would %s: %s (body from %s)", action, localRelativeFilename, bodySource)
 			} else {
 				log.Infof("[DRY RUN] Would %s (transcript-only): %s", action, localRelativeFilename)
 			}
@@ -1026,12 +1304,11 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 			continue
 		}
 
-		markdownContent := ""
-		if contentToParse != nil {
-			log.Debugf("Converting document to markdown: %s", title)
-			markdownContent = convertProseMirrorToMarkdown(*contentToParse)
+		markdownContent := noteBody
+		if noteBody != "" {
+			log.Debugf("Note body for '%s' sourced from %s", title, bodySource)
 		} else {
-			log.Infof("No suitable content found in 'last_viewed_panel' for '%s' (ID: %s); attempting transcript-only export", title, displayDocID)
+			log.Infof("No note body found for '%s' (ID: %s); attempting transcript-only export", title, displayDocID)
 		}
 
 		var transcriptMarkdown string
@@ -1044,8 +1321,8 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 			}
 		}
 
-		if contentToParse == nil && transcriptData == nil {
-			log.Warnf("Skipping document '%s' (ID: %s) - no suitable content found in 'last_viewed_panel' and no transcript available", title, displayDocID)
+		if noteBody == "" && transcriptData == nil {
+			log.Warnf("Skipping document '%s' (ID: %s) - no note body found and no transcript available", title, displayDocID)
 			skippedCount++
 			continue
 		}
