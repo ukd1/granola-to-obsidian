@@ -92,16 +92,16 @@ The tool scans existing markdown files in your output folder and builds an in-me
 
 ### File Naming
 
-Files are saved under date folders:
-`YYYY/MM/DD/YYYY-MM-DD - [sanitized_title].md`
+Files are saved under a `granola/` root in date-ordered folders:
+`granola/YYYY/MM - Mon/YYYY-MM-DD - [sanitized_title].md`
 
 If transcript data is available, a sidecar JSON file is also saved as:
-`YYYY/MM/DD/YYYY-MM-DD - [sanitized_title].transcript.json`
+`granola/YYYY/MM - Mon/YYYY-MM-DD - [sanitized_title].transcript.json`
 
 Examples:
-- `2024/01/15/2024-01-15 - Team Meeting Notes.md`
-- `2024/01/16/2024-01-16 - Project Review.md`
-- `2024/01/15/2024-01-15 - Team Meeting Notes.transcript.json`
+- `granola/2024/01 - Jan/2024-01-15 - Team Meeting Notes.md`
+- `granola/2024/02 - Feb/2024-02-16 - Project Review.md`
+- `granola/2024/01 - Jan/2024-01-15 - Team Meeting Notes.transcript.json`
 
 ### Document Structure
 

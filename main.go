@@ -1414,8 +1414,9 @@ func buildGeneratedNoteRelativePath(doc GranolaDocument) string {
 }
 
 func parseProseMirrorContent(data map[string]any) *ProseMirrorContent {
+	typeStr, _ := data["type"].(string)
 	content := ProseMirrorContent{
-		Type: data["type"].(string),
+		Type: typeStr,
 	}
 
 	if attrs, ok := data["attrs"].(map[string]any); ok {
