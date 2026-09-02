@@ -7,16 +7,23 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +36,14 @@ var (
 	ansiEscape           = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	htmlInlineSpace      = regexp.MustCompile(`\s+`)
 	htmlBlankLines       = regexp.MustCompile(`\n{3,}`)
+)
+
+const (
+	granolaClientVersion       = "7.452.4"
+	granolaAuthKeychainService = "ai.granola.sync"
+	granolaAuthKeychainAccount = "session"
+	granolaAuthCallbackScheme  = "granola"
+	granolaAuthWebRedirect     = "https://www.granola.ai/app-redirect"
 )
 
 type TranscriptSegment struct {
@@ -57,17 +72,61 @@ type DocumentsResponse struct {
 	Docs []GranolaDocument `json:"docs"`
 }
 
+type GranolaTokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+	ObtainedAt   int64  `json:"obtained_at"`
+	TokenType    string `json:"token_type,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
+	SessionID    string `json:"session_id,omitempty"`
+	SignInMethod string `json:"sign_in_method,omitempty"`
+	ExternalID   string `json:"external_id,omitempty"`
+}
+
+type granolaAuthCompleteResponse struct {
+	Tokens GranolaTokens `json:"tokens"`
+}
+
+type granolaAppIdentity struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+}
+
 // DocumentPanel is one AI-generated panel (e.g. the meeting summary) returned by
 // the get-document-panels endpoint. Content is HTML. This is the source of truth
 // for summaries regardless of whether the panel was ever opened in the desktop
 // app, unlike the last_viewed_panel field embedded in the documents response.
 type DocumentPanel struct {
-	ID               string `json:"id"`
-	TemplateSlug     string `json:"template_slug"`
-	Content          string `json:"content"`
-	ContentUpdatedAt string `json:"content_updated_at"`
-	UpdatedAt        string `json:"updated_at"`
-	DeletedAt        any    `json:"deleted_at"`
+	ID               string       `json:"id"`
+	TemplateSlug     string       `json:"template_slug"`
+	Content          PanelContent `json:"content"`
+	ContentUpdatedAt string       `json:"content_updated_at"`
+	UpdatedAt        string       `json:"updated_at"`
+	DeletedAt        any          `json:"deleted_at"`
+}
+
+// PanelContent is a panel body as served by Granola: usually an HTML string,
+// but newer panels return the ProseMirror document as a JSON object. Objects
+// are kept as their raw JSON text so panelContentToMarkdown can handle both.
+type PanelContent string
+
+func (c *PanelContent) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*c = ""
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return err
+		}
+		*c = PanelContent(text)
+		return nil
+	}
+	*c = PanelContent(trimmed)
+	return nil
 }
 
 type LocalNote struct {
@@ -100,6 +159,10 @@ func (w *teeWriter) Fd() uintptr {
 func main() {
 	fullSync := false
 	dryRun := false
+	authProvider := strings.ToLower(strings.TrimSpace(os.Getenv("GRANOLA_AUTH_PROVIDER")))
+	if authProvider == "" {
+		authProvider = "google"
+	}
 
 	var positionalArgs []string
 	for _, arg := range os.Args[1:] {
@@ -109,14 +172,20 @@ func main() {
 		case "--dry-run":
 			dryRun = true
 		default:
-			if !strings.HasPrefix(arg, "-") {
+			if strings.HasPrefix(arg, "--auth-provider=") {
+				authProvider = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--auth-provider=")))
+			} else if !strings.HasPrefix(arg, "-") {
 				positionalArgs = append(positionalArgs, arg)
 			}
 		}
 	}
 
+	if authProvider != "google" && authProvider != "microsoft" {
+		log.Fatal("--auth-provider must be google or microsoft")
+	}
+
 	if len(positionalArgs) != 1 {
-		log.Fatal("Usage: granola-sync [OPTIONS] OUTPUT_DIR")
+		log.Fatal("Usage: granola-sync [--dry-run] [--full-sync] [--auth-provider=google|microsoft] OUTPUT_DIR")
 	}
 
 	outputPath := filepath.Clean(positionalArgs[0])
@@ -161,11 +230,13 @@ func main() {
 	if fullSync {
 		log.Info("FULL SYNC MODE - All documents will be synced regardless of timestamps")
 	}
-	token, err := loadAccessToken()
-	if err != nil || token == "" {
-		log.Error("Failed to load access token. Exiting.", "err", err)
+
+	session, err := loadOrAuthenticateAccessToken(ctx, client, authProvider)
+	if err != nil || session == nil || session.AccessToken == "" {
+		log.Error("Failed to authenticate with Granola. Exiting.", "err", err)
 		os.Exit(1)
 	}
+	token := session.AccessToken
 
 	log.Info("Credentials loaded successfully. Fetching documents from Granola API...")
 
@@ -176,7 +247,13 @@ func main() {
 	}
 
 	if len(apiResponse.Docs) == 0 {
-		log.Error("API response format is unexpected - 'docs' key not found or empty")
+		account := granolaTokenEmail(session)
+		if account == "" {
+			account = "identity fingerprint " + tokenIdentityFingerprint(session)
+		}
+		log.Error("Granola returned no documents for this session", "account", account)
+		diagnoseEmptyDocuments(ctx, client, token)
+		log.Errorf("If that is not the account holding your notes, remove the stored session and re-run to sign in again: security delete-generic-password -s %s", granolaAuthKeychainService)
 		os.Exit(1)
 	}
 
@@ -224,6 +301,543 @@ func tokenExpiryFromJWT(token string) int64 {
 		return int64(exp)
 	}
 	return 0
+}
+
+func loadOrAuthenticateAccessToken(ctx context.Context, client *http.Client, authProvider string) (*GranolaTokens, error) {
+	desktopIdentity, identityErr := loadGranolaAppIdentity()
+	if identityErr != nil {
+		log.Debug("Could not load the active Granola desktop identity", "err", identityErr)
+	}
+
+	tokens, keychainErr := loadGranolaSyncSession()
+	if keychainErr == nil {
+		if mismatch := sessionAccountMismatch(tokens, desktopIdentity); mismatch != "" {
+			log.Warn("Stored Granola Sync session belongs to a different account; starting browser sign-in for the active Granola account", "detail", mismatch)
+			tokens = nil
+		} else {
+			if !granolaTokensNeedRefresh(tokens, time.Now()) {
+				log.Debug("Loaded Granola Sync session from macOS Keychain", "identity_fingerprint", tokenIdentityFingerprint(tokens))
+				return tokens, nil
+			}
+			if tokens.RefreshToken != "" {
+				refreshed, err := refreshGranolaTokens(ctx, client, tokens)
+				if err == nil {
+					return refreshed, nil
+				}
+				log.Warn("Stored Granola Sync session could not be refreshed; starting browser sign-in", "err", err)
+			}
+		}
+	} else {
+		log.Debug("No Granola Sync session found in macOS Keychain", "err", keychainErr)
+	}
+
+	legacyToken, legacyErr := loadAccessToken()
+	if legacyErr == nil && legacyToken != "" {
+		return &GranolaTokens{AccessToken: legacyToken}, nil
+	}
+	log.Debug("Legacy Granola desktop credentials are unavailable", "err", legacyErr)
+	log.Info("Starting Granola browser sign-in. Complete the sign-in in your browser to continue.")
+
+	tokens, err := authenticateWithGranola(ctx, client, authProvider, desktopIdentity.Email)
+	if err != nil {
+		return nil, fmt.Errorf("browser sign-in failed: %v", err)
+	}
+	if mismatch := sessionAccountMismatch(tokens, desktopIdentity); mismatch != "" {
+		return nil, fmt.Errorf("browser sign-in used a different account than the active Granola desktop account (%s); choose the hinted account and retry", mismatch)
+	}
+	if email := granolaTokenEmail(tokens); email != "" {
+		log.Info("Authenticated with Granola", "account", email)
+	} else {
+		log.Info("Authenticated with Granola", "identity_fingerprint", tokenIdentityFingerprint(tokens))
+	}
+	if err := saveGranolaSyncSession(tokens); err != nil {
+		return nil, fmt.Errorf("could not save Granola session to macOS Keychain: %v", err)
+	}
+	return tokens, nil
+}
+
+// sessionAccountMismatch reports why a session does not belong to the active
+// Granola desktop account, or "" when it matches or cannot be compared. Email
+// is compared first: the desktop identity ID and the token's external_id can
+// come from different ID namespaces, so an ID difference alone is not proof of
+// a different account when the emails agree.
+func sessionAccountMismatch(tokens *GranolaTokens, desktop granolaAppIdentity) string {
+	tokenEmail := strings.ToLower(strings.TrimSpace(granolaTokenEmail(tokens)))
+	desktopEmail := strings.ToLower(strings.TrimSpace(desktop.Email))
+	if tokenEmail != "" && desktopEmail != "" {
+		if tokenEmail == desktopEmail {
+			return ""
+		}
+		return fmt.Sprintf("session is for %s, desktop app is signed in as %s", tokenEmail, desktopEmail)
+	}
+	tokenID := granolaTokenExternalID(tokens)
+	if tokenID != "" && desktop.ID != "" && tokenID != desktop.ID {
+		return "session external_id differs from the desktop user ID"
+	}
+	return ""
+}
+
+// granolaTokenEmail returns the account email carried by the session's ID
+// token or access token, or "" when neither includes one.
+func granolaTokenEmail(tokens *GranolaTokens) string {
+	if tokens == nil {
+		return ""
+	}
+	for _, raw := range []string{tokens.IDToken, tokens.AccessToken} {
+		if email := jwtStringClaim(raw, "email"); email != "" {
+			return email
+		}
+	}
+	return ""
+}
+
+// jwtStringClaim returns a string claim from an unverified JWT payload, or "".
+func jwtStringClaim(token, claim string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return ""
+	}
+	value, _ := claims[claim].(string)
+	return value
+}
+
+func granolaTokensNeedRefresh(tokens *GranolaTokens, now time.Time) bool {
+	if tokens == nil || tokens.AccessToken == "" {
+		return true
+	}
+	const refreshWindow = 2 * time.Minute
+	if exp := tokenExpiryFromJWT(tokens.AccessToken); exp != 0 {
+		return now.Add(refreshWindow).Unix() >= exp
+	}
+	if tokens.ObtainedAt > 0 && tokens.ExpiresIn > 0 {
+		expiresAt := time.UnixMilli(tokens.ObtainedAt).Add(time.Duration(tokens.ExpiresIn) * time.Second)
+		return !now.Add(refreshWindow).Before(expiresAt)
+	}
+	return false
+}
+
+func loadGranolaSyncSession() (*GranolaTokens, error) {
+	out, err := readGranolaSyncKeychain(granolaAuthKeychainService, granolaAuthKeychainAccount)
+	if err != nil {
+		return nil, fmt.Errorf("keychain session unavailable: %v", err)
+	}
+
+	var tokens GranolaTokens
+	if err := json.Unmarshal(bytes.TrimSpace(out), &tokens); err != nil {
+		return nil, fmt.Errorf("invalid Granola Sync session in keychain: %v", err)
+	}
+	if tokens.AccessToken == "" {
+		return nil, fmt.Errorf("Granola Sync keychain session has no access token")
+	}
+	if fingerprint := tokenIdentityFingerprint(&tokens); fingerprint != "" {
+		log.Debug("Loaded Granola Sync session identity", "identity_fingerprint", fingerprint)
+	}
+	return &tokens, nil
+}
+
+func granolaTokenExternalID(tokens *GranolaTokens) string {
+	if tokens == nil {
+		return ""
+	}
+	if tokens.ExternalID != "" {
+		return tokens.ExternalID
+	}
+	parts := strings.Split(tokens.AccessToken, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		ExternalID string `json:"external_id"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return ""
+	}
+	return claims.ExternalID
+}
+
+func tokenIdentityFingerprint(tokens *GranolaTokens) string {
+	externalID := granolaTokenExternalID(tokens)
+	if externalID == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(externalID))
+	return hex.EncodeToString(digest[:8])
+}
+
+func loadGranolaAppIdentity() (granolaAppIdentity, error) {
+	userDataDir, err := granolaUserDataDir()
+	if err != nil {
+		return granolaAppIdentity{}, err
+	}
+
+	var sentryState struct {
+		Scope struct {
+			User granolaAppIdentity `json:"user"`
+		} `json:"scope"`
+	}
+	if data, err := os.ReadFile(filepath.Join(userDataDir, "sentry", "scope_v3.json")); err == nil {
+		if json.Unmarshal(data, &sentryState) == nil && (sentryState.Scope.User.ID != "" || sentryState.Scope.User.Email != "") {
+			return sentryState.Scope.User, nil
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(userDataDir, "supabase.json"))
+	if err != nil {
+		return granolaAppIdentity{}, fmt.Errorf("active identity unavailable in Granola app data: %v", err)
+	}
+	var legacy struct {
+		UserInfo json.RawMessage `json:"user_info"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return granolaAppIdentity{}, err
+	}
+	var identity granolaAppIdentity
+	if err := json.Unmarshal(legacy.UserInfo, &identity); err == nil && (identity.ID != "" || identity.Email != "") {
+		return identity, nil
+	}
+	var encoded string
+	if err := json.Unmarshal(legacy.UserInfo, &encoded); err != nil {
+		return granolaAppIdentity{}, fmt.Errorf("Granola user_info has an unsupported format")
+	}
+	if err := json.Unmarshal([]byte(encoded), &identity); err != nil {
+		return granolaAppIdentity{}, err
+	}
+	return identity, nil
+}
+
+func saveGranolaSyncSession(tokens *GranolaTokens) error {
+	if tokens == nil || tokens.AccessToken == "" {
+		return fmt.Errorf("refusing to save an empty session")
+	}
+	payload, err := json.Marshal(tokens)
+	if err != nil {
+		return err
+	}
+
+	if err := writeGranolaSyncKeychain(granolaAuthKeychainService, granolaAuthKeychainAccount, payload); err != nil {
+		return fmt.Errorf("Keychain Services write failed: %v", err)
+	}
+	return nil
+}
+
+func refreshGranolaTokens(ctx context.Context, client *http.Client, tokens *GranolaTokens) (*GranolaTokens, error) {
+	body, err := json.Marshal(map[string]string{"refresh_token": tokens.RefreshToken})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.granola.ai/v1/refresh-access-token", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	setAPIHeaders(req, tokens.AccessToken)
+	req.Header.Set("X-Granola-Time-Zone", time.Now().Location().String())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("refresh endpoint returned %s", resp.Status)
+	}
+
+	var refreshed GranolaTokens
+	if err := json.NewDecoder(resp.Body).Decode(&refreshed); err != nil {
+		return nil, fmt.Errorf("could not decode refreshed session: %v", err)
+	}
+	if refreshed.AccessToken == "" {
+		return nil, fmt.Errorf("refresh response did not include an access token")
+	}
+	if refreshed.RefreshToken == "" {
+		refreshed.RefreshToken = tokens.RefreshToken
+	}
+	refreshed.ObtainedAt = time.Now().UnixMilli()
+	if err := saveGranolaSyncSession(&refreshed); err != nil {
+		return nil, fmt.Errorf("token refreshed but could not be persisted: %v", err)
+	}
+	log.Debug("Refreshed Granola Sync session and updated macOS Keychain")
+	return &refreshed, nil
+}
+
+func authenticateWithGranola(ctx context.Context, client *http.Client, provider, loginHint string) (*GranolaTokens, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("browser sign-in is currently supported only on macOS")
+	}
+	verifier, err := randomURLSafeString(32)
+	if err != nil {
+		return nil, err
+	}
+	signInClickID, err := randomUUID()
+	if err != nil {
+		return nil, err
+	}
+	authURL, err := buildGranolaAuthURL(provider, verifier, signInClickID, loginHint)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := exec.Command("open", authURL).Run(); err != nil {
+		return nil, fmt.Errorf("could not open Granola sign-in in browser: %v", err)
+	}
+	log.Infof("Waiting for %s sign-in redirect (up to 10 minutes)...", provider)
+	log.Info("Granola will open after sign-in; the matching callback will be read automatically from Granola's app data.")
+	log.Info("If automatic detection does not work, copy the full https://www.granola.ai/app-redirect?... URL, paste it here, and press Return.")
+
+	rawCallback, err := waitForGranolaAuthRedirect(ctx, os.Stdin, 10*time.Minute, signInClickID, findGranolaAuthRedirectInAppData)
+	if err != nil {
+		return nil, err
+	}
+	code, err := parseGranolaAuthCallback(rawCallback, signInClickID)
+	if err != nil {
+		return nil, err
+	}
+	log.Debug("Received matching login-complete callback from Granola")
+	return exchangeGranolaAuthCode(ctx, client, code, verifier, signInClickID)
+}
+
+func randomURLSafeString(byteCount int) (string, error) {
+	raw := make([]byte, byteCount)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func randomUUID() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(raw)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
+}
+
+func buildGranolaAuthURL(provider, verifier, signInClickID, loginHint string) (string, error) {
+	if provider != "google" && provider != "microsoft" {
+		return "", fmt.Errorf("unsupported auth provider %q", provider)
+	}
+	challengeBytes := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes[:])
+
+	u, err := url.Parse("https://api.granola.ai/v1/auth")
+	if err != nil {
+		return "", err
+	}
+	query := u.Query()
+	query.Set("dev", "false")
+	query.Set("platform", "macOS")
+	query.Set("version", granolaClientVersion)
+	query.Set("sign_in_click_id", signInClickID)
+	query.Set("intent", "download")
+	query.Set("provider", provider)
+	query.Set("code_challenge", challenge)
+	query.Set("redirect", granolaAuthWebRedirect)
+	if loginHint != "" {
+		query.Set("login_hint", loginHint)
+		query.Set("select_account", "true")
+	}
+	u.RawQuery = query.Encode()
+	return u.String(), nil
+}
+
+type authRedirectFinder func(expectedSignInClickID string) (string, error)
+
+func waitForGranolaAuthRedirect(ctx context.Context, input io.Reader, timeout time.Duration, signInClickID string, finder authRedirectFinder) (string, error) {
+	inputResult := make(chan struct {
+		value string
+		err   error
+	}, 1)
+	if input != nil {
+		go func() {
+			line, err := bufio.NewReader(input).ReadString('\n')
+			inputResult <- struct {
+				value string
+				err   error
+			}{value: strings.TrimSpace(line), err: err}
+		}()
+	} else {
+		inputResult = nil
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+
+	var lastFinderErr error
+	for {
+		if finder != nil {
+			callback, err := finder(signInClickID)
+			if err != nil {
+				lastFinderErr = err
+			} else if callback != "" {
+				return callback, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+			if lastFinderErr != nil {
+				return "", fmt.Errorf("timed out waiting for browser redirect URL (automatic Granola callback detection failed: %v)", lastFinderErr)
+			}
+			return "", fmt.Errorf("timed out waiting for browser redirect URL")
+		case result := <-inputResult:
+			if result.err != nil && result.value == "" {
+				// Non-interactive launches have no stdin. Keep polling Granola's app data.
+				inputResult = nil
+				continue
+			}
+			if result.value == "" {
+				return "", fmt.Errorf("no browser redirect URL was entered")
+			}
+			return result.value, nil
+		case <-poll.C:
+		}
+	}
+}
+
+func findGranolaAuthRedirectInAppData(expectedSignInClickID string) (string, error) {
+	userDataDir, err := granolaUserDataDir()
+	if err != nil {
+		return "", err
+	}
+	return findGranolaAuthRedirectInBreadcrumbFile(filepath.Join(userDataDir, "sentry", "scope_v3.json"), expectedSignInClickID)
+}
+
+func findGranolaAuthRedirectInBreadcrumbFile(path, expectedSignInClickID string) (string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var sentryState struct {
+		Scope struct {
+			Breadcrumbs []struct {
+				Data struct {
+					Arguments []any `json:"arguments"`
+				} `json:"data"`
+			} `json:"breadcrumbs"`
+		} `json:"scope"`
+	}
+	if err := json.Unmarshal(contents, &sentryState); err != nil {
+		return "", err
+	}
+
+	for breadcrumbIndex := len(sentryState.Scope.Breadcrumbs) - 1; breadcrumbIndex >= 0; breadcrumbIndex-- {
+		arguments := sentryState.Scope.Breadcrumbs[breadcrumbIndex].Data.Arguments
+		for argumentIndex := len(arguments) - 1; argumentIndex >= 0; argumentIndex-- {
+			argument, ok := arguments[argumentIndex].(string)
+			if !ok || !strings.Contains(argument, "login-complete") {
+				continue
+			}
+			var payload struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal([]byte(argument), &payload); err != nil || payload.URL == "" {
+				continue
+			}
+			callbackURL, err := url.Parse(payload.URL)
+			if err != nil {
+				continue
+			}
+			callbackID := callbackURL.Query().Get("signInClickId")
+			if callbackID == "" {
+				callbackID = callbackURL.Query().Get("sign_in_click_id")
+			}
+			if callbackID == expectedSignInClickID {
+				return payload.URL, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func parseGranolaAuthCallback(rawCallback, expectedSignInClickID string) (string, error) {
+	callbackURL, err := url.Parse(strings.TrimSpace(rawCallback))
+	if err != nil {
+		return "", fmt.Errorf("invalid auth callback: %v", err)
+	}
+	isAppURL := callbackURL.Scheme == granolaAuthCallbackScheme && callbackURL.Host == "login-complete"
+	isWebRedirect := callbackURL.Scheme == "https" && callbackURL.Host == "www.granola.ai" && callbackURL.Path == "/app-redirect"
+	if !isAppURL && !isWebRedirect {
+		return "", fmt.Errorf("unexpected auth callback target %s://%s", callbackURL.Scheme, callbackURL.Host)
+	}
+	query := callbackURL.Query()
+	if authErr := query.Get("error"); authErr != "" {
+		return "", fmt.Errorf("Granola sign-in returned %s", authErr)
+	}
+	callbackID := query.Get("signInClickId")
+	if callbackID == "" {
+		callbackID = query.Get("sign_in_click_id")
+	}
+	if callbackID != "" && callbackID != expectedSignInClickID {
+		return "", fmt.Errorf("auth callback state did not match this sign-in attempt")
+	}
+	code := query.Get("code")
+	if code == "" {
+		return "", fmt.Errorf("auth callback did not include a code")
+	}
+	return code, nil
+}
+
+func exchangeGranolaAuthCode(ctx context.Context, client *http.Client, code, verifier, signInClickID string) (*GranolaTokens, error) {
+	payload := map[string]any{
+		"code":          code,
+		"isDev":         false,
+		"platform":      "macOS",
+		"dubId":         "",
+		"signInClickId": signInClickID,
+		"codeVerifier":  verifier,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.granola.ai/v1/workos-auth-complete", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", "Granola/"+granolaClientVersion)
+	req.Header.Set("X-Client-Version", granolaClientVersion)
+	req.Header.Set("X-Granola-Time-Zone", time.Now().Location().String())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("auth completion endpoint returned %s", resp.Status)
+	}
+
+	var result granolaAuthCompleteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("could not decode auth completion response: %v", err)
+	}
+	if result.Tokens.AccessToken == "" || result.Tokens.RefreshToken == "" {
+		return nil, fmt.Errorf("auth completion response did not include a refreshable session")
+	}
+	if result.Tokens.ObtainedAt == 0 {
+		result.Tokens.ObtainedAt = time.Now().UnixMilli()
+	}
+	return &result.Tokens, nil
 }
 
 // granolaUserDataDir returns the directory Granola.app uses for app data.
@@ -346,7 +960,10 @@ func loadAccessToken() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return loadAccessTokenFromDir(userDataDir)
+}
 
+func loadAccessTokenFromDir(userDataDir string) (string, error) {
 	encPath := filepath.Join(userDataDir, "supabase.json.enc")
 	plainPath := filepath.Join(userDataDir, "supabase.json")
 
@@ -392,6 +1009,7 @@ func loadAccessToken() (string, error) {
 	access, encErr := tryDecrypted()
 	if access != "" {
 		if exp := tokenExpiryFromJWT(access); exp != 0 && time.Now().Unix() >= exp {
+			encErr = fmt.Errorf("access token expired at %s", time.Unix(exp, 0).Format(time.RFC3339))
 			log.Warnf("Token from %s has expired; trying plaintext fallback", encPath)
 		} else {
 			log.Debugf("Loaded access token from %s", encPath)
@@ -402,14 +1020,16 @@ func loadAccessToken() (string, error) {
 	}
 
 	access, plainErr := tryPlain()
-	if access == "" {
-		return "", fmt.Errorf("could not load Granola credentials (encrypted: %v; plaintext: %v) — open the Granola desktop app to refresh, then re-run", encErr, plainErr)
+	if access != "" {
+		if exp := tokenExpiryFromJWT(access); exp != 0 && time.Now().Unix() >= exp {
+			plainErr = fmt.Errorf("access token expired at %s", time.Unix(exp, 0).Format(time.RFC3339))
+		} else {
+			log.Debugf("Loaded access token from %s", plainPath)
+			return access, nil
+		}
 	}
-	if exp := tokenExpiryFromJWT(access); exp != 0 && time.Now().Unix() >= exp {
-		return "", fmt.Errorf("Granola access tokens in both %s and %s have expired; open the Granola desktop app to refresh, then re-run", encPath, plainPath)
-	}
-	log.Debugf("Loaded access token from %s", plainPath)
-	return access, nil
+
+	return "", fmt.Errorf("could not load legacy Granola desktop credentials (encrypted: %v; plaintext: %v)", encErr, plainErr)
 }
 
 func extractTokenMap(creds map[string]any, key string) map[string]any {
@@ -438,8 +1058,8 @@ func setAPIHeaders(req *http.Request, token string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "Granola/5.354.0")
-	req.Header.Set("X-Client-Version", "5.354.0")
+	req.Header.Set("User-Agent", "Granola/"+granolaClientVersion)
+	req.Header.Set("X-Client-Version", granolaClientVersion)
 }
 
 func fetchGranolaDocuments(ctx context.Context, client *http.Client, token string) (*DocumentsResponse, error) {
@@ -475,12 +1095,16 @@ func fetchGranolaDocuments(ctx context.Context, client *http.Client, token strin
 			return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 		}
 
-		var response DocumentsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			resp.Body.Close()
+		responseBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("could not read response: %v", err)
+		}
+		response, arrayResponse, err := decodeDocumentsPage(responseBody)
+		if err != nil {
 			return nil, fmt.Errorf("could not decode response: %v", err)
 		}
-		resp.Body.Close()
+		log.Debug("Documents API response shape", "shape", describeJSONShape(responseBody))
 
 		if response.Docs == nil {
 			response.Docs = []GranolaDocument{}
@@ -497,6 +1121,10 @@ func fetchGranolaDocuments(ctx context.Context, client *http.Client, token strin
 		log.Debugf("Fetched page %d: %d docs (%d new), offset=%d", pageIndex+1, len(response.Docs), newDocsInPage, offset)
 
 		if len(response.Docs) == 0 {
+			break
+		}
+		if arrayResponse && len(response.Docs) > pageSize {
+			log.Debug("Bulk documents endpoint returned the complete array; pagination is not needed")
 			break
 		}
 		if len(response.Docs) < pageSize {
@@ -516,6 +1144,99 @@ func fetchGranolaDocuments(ctx context.Context, client *http.Client, token strin
 	}
 
 	return &DocumentsResponse{Docs: allDocs}, nil
+}
+
+func decodeDocumentsPage(data []byte) (DocumentsResponse, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return DocumentsResponse{}, false, fmt.Errorf("empty response body")
+	}
+	if trimmed[0] == '[' {
+		var docs []GranolaDocument
+		if err := json.Unmarshal(trimmed, &docs); err != nil {
+			return DocumentsResponse{}, true, err
+		}
+		return DocumentsResponse{Docs: docs}, true, nil
+	}
+	var response DocumentsResponse
+	if err := json.Unmarshal(trimmed, &response); err != nil {
+		return DocumentsResponse{}, false, err
+	}
+	return response, false, nil
+}
+
+// diagnoseEmptyDocuments probes the alternate documents endpoint and the
+// legacy client version so an empty result can be attributed to the account
+// rather than to an endpoint or header change. It only logs.
+func diagnoseEmptyDocuments(ctx context.Context, client *http.Client, token string) {
+	probes := []struct {
+		url     string
+		version string
+	}{
+		{"https://api.granola.ai/v1/get-documents", granolaClientVersion},
+		{"https://api.granola.ai/v2/get-documents", "5.354.0"},
+	}
+	body := []byte(`{"limit":5,"offset":0,"include_last_viewed_panel":false}`)
+	for _, probe := range probes {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, probe.url, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		setAPIHeaders(req, token)
+		req.Header.Set("User-Agent", "Granola/"+probe.version)
+		req.Header.Set("X-Client-Version", probe.version)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Warn("Documents probe failed", "url", probe.url, "client_version", probe.version, "err", err)
+			continue
+		}
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		log.Info("Documents probe", "url", probe.url, "client_version", probe.version, "status", resp.StatusCode, "shape", describeJSONShape(responseBody))
+	}
+}
+
+func describeJSONShape(data []byte) string {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return "invalid JSON"
+	}
+	return describeJSONValue(value, 0)
+}
+
+func describeJSONValue(value any, depth int) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if depth >= 1 {
+				parts = append(parts, key)
+				continue
+			}
+			parts = append(parts, key+":"+describeJSONValue(typed[key], depth+1))
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	case []any:
+		if len(typed) == 0 {
+			return "array[0]"
+		}
+		return fmt.Sprintf("array[%d]<%s>", len(typed), describeJSONValue(typed[0], depth+1))
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "bool"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
 }
 
 func fetchDocumentTranscript(ctx context.Context, client *http.Client, token, docID string) (string, []TranscriptSegment, error) {
@@ -548,6 +1269,12 @@ func fetchDocumentTranscript(ctx context.Context, client *http.Client, token, do
 	}
 
 	log.Debugf("Transcript segments count: %d", len(transcript))
+	if len(transcript) == 0 {
+		// Granola returns an empty list for meetings that were never recorded.
+		// Treat it exactly like a 404 so the caller does not write an empty
+		// sidecar or mark the note has_transcript: true.
+		return "", nil, nil
+	}
 	formatted := formatTranscriptSegments(transcript)
 
 	return formatted, transcript, nil
@@ -594,7 +1321,7 @@ func selectSummaryPanel(panels []DocumentPanel) *DocumentPanel {
 
 	for i := range panels {
 		p := &panels[i]
-		if p.DeletedAt != nil || strings.TrimSpace(p.Content) == "" {
+		if p.DeletedAt != nil || strings.TrimSpace(string(p.Content)) == "" {
 			continue
 		}
 
@@ -813,7 +1540,7 @@ func resolveNoteBody(ctx context.Context, client *http.Client, token string, doc
 		return "", ""
 	}
 
-	md := panelContentToMarkdown(panel.Content)
+	md := panelContentToMarkdown(string(panel.Content))
 	if md == "" {
 		return "", ""
 	}
@@ -960,7 +1687,7 @@ func buildOutputRelativePath(datePrefix, filename string) string {
 
 	yearDir := t.Format("2006")
 	monthDir := t.Format("01") + " - " + t.Format("Jan")
-	return filepath.Join("granola", yearDir, monthDir, filename)
+	return filepath.Join(yearDir, monthDir, filename)
 }
 
 func parseFrontmatter(fpath string) (map[string]string, error) {
@@ -1329,7 +2056,11 @@ func syncDocuments(ctx context.Context, client *http.Client, documents []Granola
 			continue
 		}
 
-		frontmatter := buildFrontmatter(doc, transcriptData != nil)
+		var preservedFrontmatter map[string]string
+		if isUpdate {
+			preservedFrontmatter = readFrontmatterBlocks(filePath)
+		}
+		frontmatter := buildFrontmatter(doc, transcriptData != nil, preservedFrontmatter)
 		finalMarkdown := frontmatter
 
 		if markdownContent != "" {
@@ -1438,7 +2169,11 @@ func parseProseMirrorContent(data map[string]any) *ProseMirrorContent {
 	return &content
 }
 
-func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
+// buildFrontmatter renders the note frontmatter. Granola-owned fields are
+// regenerated every time; the hand-maintained with: and tags: blocks are taken
+// from preserved (see readFrontmatterBlocks) when the existing note has
+// non-empty values, so updating a note never discards vault edits.
+func buildFrontmatter(doc GranolaDocument, hasTranscript bool, preserved map[string]string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "granola_id: %s\n", doc.ID)
@@ -1457,9 +2192,82 @@ func buildFrontmatter(doc GranolaDocument, hasTranscript bool) string {
 	} else {
 		b.WriteString("has_transcript: false\n")
 	}
-	b.WriteString("with: []\n")
 
-	b.WriteString("tags:\n  - meeting\n")
+	if block := preserved["with"]; frontmatterBlockHasValue(block) {
+		b.WriteString(block + "\n")
+	} else {
+		b.WriteString("with: []\n")
+	}
+
+	if block := preserved["tags"]; frontmatterBlockHasValue(block) {
+		b.WriteString(block + "\n")
+	} else {
+		b.WriteString("tags:\n  - meeting\n")
+	}
 	b.WriteString("---\n\n")
 	return b.String()
+}
+
+// readFrontmatterBlocks returns the raw YAML text of each top-level key in a
+// note's frontmatter: the "key:" line plus its indented or list continuation
+// lines. It returns nil when the file cannot be read or has no frontmatter.
+func readFrontmatterBlocks(path string) map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if !strings.HasPrefix(text, "---\n") {
+		return nil
+	}
+	end := strings.Index(text[4:], "\n---\n")
+	if end < 0 {
+		return nil
+	}
+
+	blocks := make(map[string]string)
+	var currentKey string
+	var current []string
+	flush := func() {
+		if currentKey != "" {
+			blocks[currentKey] = strings.TrimRight(strings.Join(current, "\n"), "\n")
+		}
+	}
+	for _, line := range strings.Split(text[4:4+end], "\n") {
+		isContinuation := line == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "-")
+		if !isContinuation {
+			if idx := strings.Index(line, ":"); idx > 0 {
+				flush()
+				currentKey = strings.TrimSpace(line[:idx])
+				current = []string{line}
+				continue
+			}
+		}
+		if currentKey != "" {
+			current = append(current, line)
+		}
+	}
+	flush()
+	return blocks
+}
+
+// frontmatterBlockHasValue reports whether a raw frontmatter block carries a
+// real value rather than an empty scalar or an empty list.
+func frontmatterBlockHasValue(block string) bool {
+	lines := strings.Split(block, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	if idx := strings.Index(lines[0], ":"); idx >= 0 {
+		inline := strings.TrimSpace(lines[0][idx+1:])
+		if inline != "" && inline != "[]" && inline != "{}" && inline != "null" && inline != "~" {
+			return true
+		}
+	}
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) != "" {
+			return true
+		}
+	}
+	return false
 }
